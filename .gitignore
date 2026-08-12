@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Models — too large for GitHub
+models/
+*.pt
+*.pth
+
+# Datasets — too large
+datasets/
+
+# Outputs
+outputs/frames/
+outputs/clips/
+outputs/logs/
+
+# Environment
+.env
+venv/
+env/
+
+# VS Code
+.vscode/
+
+# Kaggle
+*.json
+!outputs/manifests/*.csv
+
+# YOLO cache
+runs/
