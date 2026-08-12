@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Haven - Set up your account</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/haven.css') }}">
+</head>
+<body>
+
+<div style="font-family:Figtree,system-ui,sans-serif;color:#2B1A08;background:#2E2B1B;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:48px">
+  <div style="width:min(420px,100%);background:#F7F5E9;border-radius:28px;padding:40px 36px;box-shadow:0 12px 32px rgba(0,0,0,0.3)">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:28px">
+      <div style="width:28px;height:28px;border-radius:999px;background:#C9A227"></div>
+      <span class="display-font" style="font-size:18px">Haven</span>
+    </div>
+
+    {% if not invite %}
+      <h2 class="display-font" style="font-weight:500;font-size:24px;margin:0 0 6px">Invite link invalid</h2>
+      <p style="font-size:13px;color:rgba(43,26,8,0.65);margin:0 0 24px">This sign-up link is missing, expired, or has already been used. Ask your administrator to send you a new invite.</p>
+      <a href="{{ url_for('login') }}" class="display-font" style="display:inline-flex;align-items:center;gap:8px;background:#C9A227;color:#2B1A08;font-size:15px;padding:13px 26px;border-radius:999px;text-decoration:none">Back to sign in</a>
+    {% else %}
+      <h2 class="display-font" style="font-weight:500;font-size:24px;margin:0 0 6px">Set up your account</h2>
+      <p style="font-size:13px;color:rgba(43,26,8,0.6);margin:0 0 24px">
+        You were invited as <strong>{{ invite.role }}</strong> for <strong>{{ invite.email }}</strong>. Choose a password to finish setting up your account.
+      </p>
+
+      {% if error %}
+      <div style="background:#F3D9C8;color:#7A2E12;font-size:13px;padding:10px 14px;border-radius:12px;margin-bottom:16px">{{ error }}</div>
+      {% endif %}
+
+      <form method="POST" action="{{ url_for('signup', token=token) }}">
+        <input type="hidden" name="token" value="{{ token }}">
+        <div style="margin-bottom:14px">
+          <label style="display:block;font-size:12px;color:rgba(43,26,8,0.65);margin-bottom:6px">Email</label>
+          <input type="email" value="{{ invite.email }}" disabled style="width:100%;padding:12px 16px;font-size:14px;border:1px solid rgba(43,26,8,0.18);border-radius:999px;background:#EFEBD8;color:rgba(43,26,8,0.6)">
+        </div>
+        <div style="margin-bottom:14px">
+          <label for="password" style="display:block;font-size:12px;color:rgba(43,26,8,0.65);margin-bottom:6px">Password</label>
+          <input id="password" name="password" type="password" autocomplete="new-password" required minlength="8" placeholder="At least 8 characters" style="width:100%;padding:12px 16px;font-size:14px;border:1px solid rgba(43,26,8,0.18);border-radius:999px;background:#fff">
+        </div>
+        <div style="margin-bottom:22px">
+          <label for="confirm_password" style="display:block;font-size:12px;color:rgba(43,26,8,0.65);margin-bottom:6px">Confirm password</label>
+          <input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" required minlength="8" placeholder="Re-enter your password" style="width:100%;padding:12px 16px;font-size:14px;border:1px solid rgba(43,26,8,0.18);border-radius:999px;background:#fff">
+        </div>
+        <button type="submit" class="display-font" style="width:100%;background:#C9A227;color:#2B1A08;font-size:15px;padding:13px;border-radius:999px;border:none;cursor:pointer">Create account</button>
+      </form>
+      <div style="margin-top:18px;font-size:13px;color:rgba(43,26,8,0.45)">This link works once. Once your account is created, use the regular sign-in page from now on.</div>
+    {% endif %}
+  </div>
+</div>
+</body>
+</html>
