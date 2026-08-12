@@ -35,3 +35,5 @@ env/
 
 # YOLO cache
 runs/
+
+src/detection/config.py
