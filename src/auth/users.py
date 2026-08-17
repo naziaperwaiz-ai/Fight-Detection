@@ -88,7 +88,16 @@ def verify_caregiver(email, password):
     return record
 
 
-def create_caregiver(email, password, name=None, role="caregiver"):
+def create_caregiver(email, password, name=None, role="caregiver", assigned_rooms=None):
+    """assigned_rooms: list of room names this caregiver can view cameras,
+    incidents, and clips for. Ignored for admins (admins always see every
+    room -- see app.py's Caregiver.can_access_room). Defaults to [] --
+    i.e. NO rooms -- for caregivers, on purpose: a newly-created caregiver
+    account should not default to seeing every patient's video before an
+    admin has deliberately assigned them a zone. This is a stricter
+    default than most fields here, and that's intentional for anything
+    that gates access to patient video.
+    """
     email = (email or "").strip().lower()
     if not email or "@" not in email:
         raise ValueError("A valid email is required.")
@@ -106,12 +115,29 @@ def create_caregiver(email, password, name=None, role="caregiver"):
             "email": email,
             "name": name or email,
             "role": role,
+            "assigned_rooms": list(assigned_rooms) if assigned_rooms else [],
             "password_hash": generate_password_hash(password),
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         users.append(record)
         _save(users)
     return record
+
+
+def set_assigned_rooms(email, rooms):
+    """Admin-facing: update which rooms an existing caregiver can access.
+    Returns the updated record, or None if no account has this email.
+    """
+    email = (email or "").strip().lower()
+    rooms = [r for r in (rooms or []) if isinstance(r, str) and r.strip()]
+    with _lock:
+        users = _load()
+        for u in users:
+            if u["email"] == email:
+                u["assigned_rooms"] = rooms
+                _save(users)
+                return u
+    return None
 
 
 def list_caregivers():
@@ -145,8 +171,13 @@ def _save_invites(invites):
     INVITES_FILE.write_text(json.dumps(invites, indent=2))
 
 
-def create_invite(email, name, role, invited_by):
-    """Create a one-time invite. Only callable from an admin-only route."""
+def create_invite(email, name, role, invited_by, assigned_rooms=None):
+    """Create a one-time invite. Only callable from an admin-only route.
+
+    assigned_rooms: rooms the resulting caregiver account will be able to
+    see (ignored for admin invites). Defaults to [] -- see create_caregiver
+    for why that's the deliberate default, not an oversight.
+    """
     email = (email or "").strip().lower()
     if not email or "@" not in email:
         raise ValueError("A valid email is required.")
@@ -166,6 +197,7 @@ def create_invite(email, name, role, invited_by):
             "email": email,
             "name": name or email,
             "role": role,
+            "assigned_rooms": list(assigned_rooms) if assigned_rooms else [],
             "invited_by": invited_by,
             "created_at": now,
             "expires_at": now + INVITE_TTL_SECONDS,
@@ -221,6 +253,7 @@ def consume_invite(token, password):
             "email": invite["email"],
             "name": invite["name"],
             "role": invite["role"],
+            "assigned_rooms": invite.get("assigned_rooms", []),
             "password_hash": generate_password_hash(password),
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }

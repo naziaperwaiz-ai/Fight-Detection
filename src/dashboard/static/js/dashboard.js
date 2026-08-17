@@ -8,6 +8,8 @@ const STATUS_STYLE = {
   Normal:    { bg: '#EAF0DE', fg: '#405221', dot: '#6D8B3E' },
   Elevated:  { bg: '#F5EAB4', fg: '#7C6212', dot: '#A3811A' },
   Fighting:  { bg: '#F3D9C8', fg: '#7A2E12', dot: '#A6491C' },
+  Fall:      { bg: '#F5D9C0', fg: '#8A3B12', dot: '#C15A1C' },
+  Hazard:    { bg: '#E8C4C0', fg: '#7A1F1F', dot: '#A62E2E' },
   Emergency: { bg: '#3D1200', fg: '#FBEFE6', dot: '#FBEFE6' },
 };
 const PRIORITY_STYLE = {
@@ -17,9 +19,15 @@ const PRIORITY_STYLE = {
 };
 const TYPE_STYLE = {
   'Violence Detected': { bg: '#F3D9C8', fg: '#7A2E12' },
+  'Fall Detected':     { bg: '#F5D9C0', fg: '#8A3B12' },
+  'Hazard Detected':   { bg: '#E8C4C0', fg: '#7A1F1F' },
   'Emergency':         { bg: '#3D1200', fg: '#FBEFE6' },
   'Clip Ready':        { bg: '#EAF0DE', fg: '#405221' },
 };
+// Event types that count as an "alert" for the banner, zone status, and
+// the notification sound below -- kept in one place so all three agree.
+const ALERT_TYPES = ['Violence Detected', 'Fall Detected', 'Hazard Detected', 'Emergency'];
+
 const NAV_ITEMS = [
   { key: 'dashboard', label: 'Dashboard' },
   { key: 'persona', label: 'My profile' },
@@ -39,13 +47,16 @@ const Haven = {
     cameras: [],
     events: [],
     clips: [],
-    settings: { recipients: [], threshold: 90, cooldown: 120, email_channel: true },
+    settings: { recipients: [], threshold: 90, cooldown: 120, email_channel: true, sound_channel: true, desktop_channel: true },
     systemSettings: {},
     selectedIncidentId: null,
     editingCamera: null,
     deleteConfirmId: null,
     emailPopupPending: null,
     openPreviews: new Set(), // camera ids currently streaming a live preview
+    notifiedAlertIds: new Set(), // alert-event ids we've already played a sound for
+    eventsLoadedOnce: false,     // first loadEvents() only establishes a baseline -- no sound
+    audioCtx: null,              // created lazily on first user gesture (autoplay policy)
   },
 
   async init() {
@@ -54,11 +65,83 @@ const Haven = {
     this.renderNav();
     this.startClock();
     this.renderCalendarStrip();
+    // Browsers block audio until the page has seen a user gesture. Grab the
+    // first click anywhere to unlock the AudioContext so a later alert sound
+    // (fired from the 15s poll, with no gesture of its own) can actually play.
+    document.addEventListener('click', () => this._unlockAudio(), { once: true });
     await Promise.all([this.loadCameras(), this.loadEvents(), this.loadSettings()]);
     this.loadAnnouncements();
     document.getElementById('dash-greet-name').textContent = (root.dataset.caregiverName || '').split(' ')[0];
     this.goPage('dashboard');
     setInterval(() => this.loadEvents(), 15000);
+  },
+
+  // ---------------- Alert sound ----------------
+  _unlockAudio() {
+    if (this.state.audioCtx) return;
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    this.state.audioCtx = new Ctx();
+  },
+  playAlertSound() {
+    if (this.state.settings.sound_channel === false) return;
+    this._unlockAudio();
+    const ctx = this.state.audioCtx;
+    if (!ctx) return;
+    if (ctx.state === 'suspended') ctx.resume();
+    // Two-tone chime -- short and distinct from a UI click, not alarm-siren
+    // harsh (caregivers may hear this often; it shouldn't be startling).
+    const now = ctx.currentTime;
+    [[880, now, 0.16], [1175, now + 0.16, 0.22]].forEach(([freq, start, dur]) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(0.22, start + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(start);
+      osc.stop(start + dur + 0.02);
+    });
+  },
+
+  // ---------------- Desktop (OS) notification ----------------
+  // Native OS toast via the Notification API. Only fires while this tab is
+  // open somewhere (foreground or backgrounded) -- it can't reach a closed
+  // browser or a locked phone; that would need Push API + a service worker
+  // + a server-side sender, which is a separate, much larger feature.
+  //
+  // Browsers only allow Notification on a secure context (https, or
+  // literally "localhost"). If this dashboard is reached over plain HTTP
+  // via a LAN IP -- which `app.run(host="0.0.0.0", ...)` suggests it is --
+  // requestPermission()/the constructor will silently fail. We detect that
+  // and surface it in the UI rather than pretending the toggle works.
+  desktopNotificationsSupported() {
+    return ('Notification' in window) && window.isSecureContext;
+  },
+  async requestDesktopPermission() {
+    if (!this.desktopNotificationsSupported()) return 'unsupported';
+    if (Notification.permission === 'default') {
+      try { return await Notification.requestPermission(); }
+      catch (e) { return 'denied'; }
+    }
+    return Notification.permission; // 'granted' or 'denied'
+  },
+  showDesktopNotification(event) {
+    if (this.state.settings.desktop_channel === false) return;
+    if (!this.desktopNotificationsSupported()) return;
+    if (Notification.permission !== 'granted') return;
+    const pct = Math.round((event.confidence || 0) * 100);
+    try {
+      new Notification(`Haven: ${event.event_type}`, {
+        body: `${esc(event.camera_id)} · ${esc(event.room)} · ${pct}% confidence`,
+        tag: `haven-alert-${event.id}`, // de-dupes if the same alert fires the callback twice
+      });
+    } catch (e) {
+      // Constructor throws on some insecure/embedded contexts even when
+      // permission reads 'granted' -- fail quietly, the chime still fired.
+    }
   },
 
   // ---------------- Navigation ----------------
@@ -168,8 +251,30 @@ const Haven = {
   async loadEvents() {
     const res = await fetch('/api/events');
     this.state.events = await res.json();
+    this._checkForNewAlerts();
     if (this.state.page === 'dashboard') this.renderDashboard();
     if (this.state.page === 'incidents') this.renderIncidents();
+  },
+  // Compares the freshly-fetched events against what we've already notified
+  // on, and plays the alert sound once if anything genuinely new showed up.
+  // The very first call (page load) only records a baseline -- otherwise
+  // every pre-existing open incident would chime the moment the dashboard
+  // opens.
+  _checkForNewAlerts() {
+    const openAlerts = this.state.events.filter(e =>
+      ALERT_TYPES.includes(e.event_type) && !e.reviewed && !e.false_positive
+    );
+    const freshAlerts = this.state.eventsLoadedOnce
+      ? openAlerts.filter(e => !this.state.notifiedAlertIds.has(e.id))
+      : [];
+    openAlerts.forEach(e => this.state.notifiedAlertIds.add(e.id));
+    if (freshAlerts.length) {
+      this.playAlertSound();
+      // One OS toast per new alert, not one summary -- each names a
+      // different room/camera and a caregiver needs to know which.
+      freshAlerts.forEach(e => this.showDesktopNotification(e));
+    }
+    this.state.eventsLoadedOnce = true;
   },
   async loadClips() {
     const res = await fetch('/api/clips');
@@ -210,6 +315,8 @@ const Haven = {
     const now = Date.now();
     const recent = this.state.events.filter(e => e.room === room && (now - new Date(e.timestamp).getTime()) < 15 * 60000);
     if (recent.some(e => e.event_type === 'Emergency')) return 'Emergency';
+    if (recent.some(e => e.event_type === 'Fall Detected')) return 'Fall';
+    if (recent.some(e => e.event_type === 'Hazard Detected')) return 'Hazard';
     if (recent.some(e => e.event_type === 'Violence Detected')) return 'Fighting';
     return 'Normal';
   },
@@ -242,7 +349,7 @@ const Haven = {
     }).join('') || '<div class="card" style="padding:18px;font-size:13px;color:rgba(43,26,8,0.5)">No cameras configured yet. Add one from the Cameras page.</div>';
 
     // Zone status bar chart (share of zones in each state).
-    const counts = { Normal: 0, Fighting: 0, Emergency: 0 };
+    const counts = { Normal: 0, Fighting: 0, Fall: 0, Hazard: 0, Emergency: 0 };
     cams.forEach(c => { const s = this.zoneStatusFor(c.room); counts[s] = (counts[s] || 0) + 1; });
     const total = cams.length || 1;
     const bars = document.getElementById('zone-status-bars');
@@ -261,10 +368,10 @@ const Haven = {
     document.getElementById('qa-open-incidents-tag').textContent = `${openIncidents} open`;
     document.getElementById('qa-offline-cams-tag').textContent = `${offlineCams} offline`;
 
-    // Active alert banner: an unresolved Violence Detected / Emergency event in the last 10 minutes.
+    // Active alert banner: an unresolved Violence/Fall/Hazard/Emergency event in the last 10 minutes.
     const now = Date.now();
     const active = this.state.events.filter(e =>
-      (e.event_type === 'Violence Detected' || e.event_type === 'Emergency') &&
+      ALERT_TYPES.includes(e.event_type) &&
       !e.reviewed && !e.false_positive &&
       (now - new Date(e.timestamp).getTime()) < 10 * 60000
     ).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))[0];
@@ -511,8 +618,10 @@ const Haven = {
             ${states.length ? states.map(s => `
               <div class="card" style="padding:16px">
                 <div style="font-weight:600;font-size:14px;margin-bottom:4px">Person ${esc(String(s.track_id !== undefined ? s.track_id : ''))}</div>
-                <div style="font-size:13px;color:rgba(43,26,8,0.65)">State: ${esc(s.state || 'unknown')}${s.score !== undefined ? ' &middot; score ' + Math.round(s.score * 100) + '%' : ''}</div>
-              </div>`).join('') : `<div class="disabled-note">No per-person state snapshot was recorded for this incident (older event, or the detector didn't have a live tracker at alert time).</div>`}
+                <div style="font-size:13px;color:rgba(43,26,8,0.65)">State: ${esc(s.state || 'unknown')}${s.score !== undefined ? ' &middot; score ' + Math.round(s.score * 100) + '%' : ''}${s.fall_status && s.fall_status !== 'None' ? ' &middot; fall: ' + esc(s.fall_status) : ''}</div>
+              </div>`).join('') : (inc.event_type === 'Hazard Detected'
+                ? `<div class="disabled-note">Hazard events aren't tied to a specific tracked person -- see the rule detail in the Summary panel instead.</div>`
+                : `<div class="disabled-note">No per-person state snapshot was recorded for this incident (older event, or the detector didn't have a live tracker at alert time).</div>`)}
           </div>
           <h4 style="font-size:14px;margin:0 0 10px">Notes</h4>
           <textarea id="incident-notes" class="pill-input" style="width:100%;min-height:80px;border-radius:16px" placeholder="Add a follow-up note for the day shift...">${esc(inc.notes || '')}</textarea>
@@ -527,6 +636,7 @@ const Haven = {
           <div class="card" style="padding:16px;font-size:13px;line-height:1.7;color:rgba(43,26,8,0.75)">
             Event type: <strong>${esc(inc.event_type)}</strong><br>
             Confidence: <strong>${pct}%</strong><br>
+            ${inc.detail ? `Detail: <strong>${esc(inc.detail)}</strong><br>` : ''}
             Reviewed: <strong>${inc.reviewed ? 'Yes' : 'No'}</strong><br>
             Marked false positive: <strong>${inc.false_positive ? 'Yes' : 'No'}</strong>
           </div>
@@ -586,6 +696,28 @@ const Haven = {
     const knob = document.getElementById('email-toggle-knob');
     toggle.style.background = s.email_channel ? '#405221' : '#E1DBBE';
     knob.style.left = s.email_channel ? '23px' : '3px';
+
+    const soundToggle = document.getElementById('sound-toggle');
+    const soundKnob = document.getElementById('sound-toggle-knob');
+    if (soundToggle && soundKnob) {
+      const soundOn = s.sound_channel !== false;
+      soundToggle.style.background = soundOn ? '#405221' : '#E1DBBE';
+      soundKnob.style.left = soundOn ? '23px' : '3px';
+    }
+
+    const desktopToggle = document.getElementById('desktop-toggle');
+    const desktopKnob = document.getElementById('desktop-toggle-knob');
+    if (desktopToggle && desktopKnob) {
+      const desktopOn = s.desktop_channel !== false;
+      desktopToggle.style.background = desktopOn ? '#405221' : '#E1DBBE';
+      desktopKnob.style.left = desktopOn ? '23px' : '3px';
+    }
+    const warning = document.getElementById('desktop-notif-warning');
+    if (warning) {
+      // Only show the "won't actually work" note when it's genuinely true
+      // for this browser/origin -- not a blanket disclaimer.
+      warning.style.display = this.desktopNotificationsSupported() ? 'none' : 'block';
+    }
   },
   onThresholdChange() { document.getElementById('threshold-val').textContent = document.getElementById('threshold-range').value + '%'; },
   onCooldownChange() { document.getElementById('cooldown-val').textContent = document.getElementById('cooldown-range').value + 's'; },
@@ -605,12 +737,37 @@ const Haven = {
     this.state.settings.email_channel = !this.state.settings.email_channel;
     this.renderAlertsPage();
   },
+  toggleSoundChannel() {
+    this.state.settings.sound_channel = !(this.state.settings.sound_channel !== false);
+    this.renderAlertsPage();
+    // Unlock + preview immediately so the toggle click itself is the user
+    // gesture that lets audio play (no waiting for the next real alert).
+    if (this.state.settings.sound_channel) this.playAlertSound();
+  },
+  async toggleDesktopChannel() {
+    const turningOn = !(this.state.settings.desktop_channel !== false);
+    this.state.settings.desktop_channel = turningOn;
+    if (turningOn) {
+      // The permission prompt has to originate from this click (a user
+      // gesture) -- it can't be requested later from the background poll.
+      const result = await this.requestDesktopPermission();
+      if (result === 'granted') {
+        try { new Notification('Haven notifications enabled', { body: 'You\'ll get a desktop alert here when something needs attention.' }); }
+        catch (e) { /* non-fatal preview */ }
+      } else if (result === 'denied') {
+        alert('Desktop notifications are blocked for this site in your browser settings. The sound alert will still play.');
+      }
+    }
+    this.renderAlertsPage();
+  },
   async saveAlertSettings() {
     const payload = {
       recipients: this.state.settings.recipients,
       threshold: parseInt(document.getElementById('threshold-range').value, 10),
       cooldown: parseInt(document.getElementById('cooldown-range').value, 10),
       email_channel: this.state.settings.email_channel,
+      sound_channel: this.state.settings.sound_channel,
+      desktop_channel: this.state.settings.desktop_channel,
     };
     await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     await this.loadSettings();
@@ -622,6 +779,7 @@ const Haven = {
     const res = await fetch('/api/settings/test-alert', { method: 'POST' });
     const data = await res.json();
     if (!res.ok) { alert(data.error || 'Could not send test alert.'); return; }
+    this.playAlertSound();
     document.getElementById('email-popup-context').textContent = 'This is a test alert. No incident occurred.';
     document.getElementById('email-popup-recipients').textContent = 'To: ' + data.recipients.join(', ');
     document.getElementById('email-popup-backdrop').style.display = 'flex';
@@ -667,17 +825,21 @@ const Haven = {
     document.getElementById('sys-motion-threshold').value = s.motion_threshold;
     document.getElementById('sys-buffer').value = s.buffer_seconds;
     document.getElementById('sys-post-event').value = s.post_event_seconds;
+    document.getElementById('sys-retention-days').value = s.retention_days;
+    document.getElementById('sys-fp-retention-days').value = s.false_positive_retention_days;
 
     const isAdmin = this.state.isAdmin;
-    ['sys-confirm-seconds', 'sys-motion-threshold', 'sys-buffer', 'sys-post-event'].forEach(id => {
+    ['sys-confirm-seconds', 'sys-motion-threshold', 'sys-buffer', 'sys-post-event', 'sys-retention-days', 'sys-fp-retention-days'].forEach(id => {
       document.getElementById(id).disabled = !isAdmin;
     });
     document.getElementById('detection-defaults-note').style.display = isAdmin ? 'none' : 'block';
     document.getElementById('upload-model-btn').style.display = isAdmin ? 'inline-block' : 'none';
     document.getElementById('upload-model-note').style.display = isAdmin ? 'none' : 'block';
     document.getElementById('save-system-btn').style.display = isAdmin ? 'inline-block' : 'none';
+    document.getElementById('retention-card').style.display = isAdmin ? 'block' : 'none';
     document.getElementById('invites-card').style.display = isAdmin ? 'block' : 'none';
-    if (isAdmin) this.loadInvites();
+    document.getElementById('caregiver-rooms-card').style.display = isAdmin ? 'block' : 'none';
+    if (isAdmin) { this.loadInvites(); this.loadCaregiverRooms(); this.loadCleanupStatus(); }
 
     const health = document.getElementById('camera-health-list');
     health.innerHTML = this.state.cameras.map(cam => `
@@ -707,6 +869,7 @@ const Haven = {
     const email = document.getElementById('invite-email').value.trim();
     const name  = document.getElementById('invite-name').value.trim();
     const role  = document.getElementById('invite-role').value;
+    const rooms = document.getElementById('invite-rooms').value.split(',').map(r => r.trim()).filter(Boolean);
     const box = document.getElementById('invite-link-box');
     const errBox = document.getElementById('invite-error');
     box.style.display = 'none';
@@ -715,16 +878,52 @@ const Haven = {
 
     const res = await fetch('/api/invites', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, name, role }),
+      body: JSON.stringify({ email, name, role, assigned_rooms: rooms }),
     });
     const data = await res.json();
     if (!res.ok) { errBox.textContent = data.error || 'Could not create invite.'; errBox.style.display = 'block'; return; }
 
-    box.innerHTML = `Invite link for <strong>${esc(data.email)}</strong> (expires in 7 days). Copy and send this to them:<br><code style="word-break:break-all">${esc(data.link)}</code>`;
+    const roomNote = role === 'admin' ? 'sees every room (admin)' : (rooms.length ? `rooms: ${rooms.join(', ')}` : 'NO rooms assigned yet -- they will see nothing until you assign some here');
+    box.innerHTML = `Invite link for <strong>${esc(data.email)}</strong> (expires in 7 days, ${esc(roomNote)}). Copy and send this to them:<br><code style="word-break:break-all">${esc(data.link)}</code>`;
     box.style.display = 'block';
     document.getElementById('invite-email').value = '';
     document.getElementById('invite-name').value = '';
+    document.getElementById('invite-rooms').value = '';
     this.loadInvites();
+  },
+
+  // ---------------- Caregiver room access (admin only) ----------------
+  async loadCaregiverRooms() {
+    const res = await fetch('/api/caregivers');
+    if (!res.ok) return;
+    const caregivers = await res.json();
+    const list = document.getElementById('caregiver-rooms-list');
+    list.innerHTML = caregivers.map(u => {
+      const isAdminAcct = u.role === 'admin';
+      const rooms = (u.assigned_rooms || []).join(', ');
+      const inputId = `rooms-${esc(u.email).replace(/[^a-zA-Z0-9]/g, '_')}`;
+      return `
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid rgba(43,26,8,0.08)">
+        <div style="min-width:0">
+          <div style="font-weight:600">${esc(u.name || u.email)} <span style="font-weight:400;color:rgba(43,26,8,0.5);font-size:12px">${esc(u.role)}</span></div>
+          <div style="font-size:12px;color:rgba(43,26,8,0.5)">${esc(u.email)}</div>
+        </div>
+        ${isAdminAcct
+          ? `<span style="font-size:12px;color:rgba(43,26,8,0.5);flex:none">Sees every room</span>`
+          : `<div style="display:flex;gap:8px;align-items:center;flex:none">
+               <input id="${inputId}" type="text" value="${esc(rooms)}" placeholder="Ward A, Ward B" class="pill-input" style="width:220px;border-radius:12px;font-size:12px;${rooms ? '' : 'border-color:#C15A1C'}">
+               <button class="pill-btn pill-btn-outline" style="padding:4px 12px;font-size:11px" onclick="Haven.saveCaregiverRooms('${esc(u.email)}','${inputId}')">Save</button>
+             </div>`}
+      </div>`;
+    }).join('') || '<div style="font-size:13px;color:rgba(43,26,8,0.5)">No accounts yet.</div>';
+  },
+  async saveCaregiverRooms(email, inputId) {
+    const rooms = document.getElementById(inputId).value.split(',').map(r => r.trim()).filter(Boolean);
+    const res = await fetch(`/api/caregivers/${encodeURIComponent(email)}/rooms`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assigned_rooms: rooms }),
+    });
+    if (res.ok) this.loadCaregiverRooms();
   },
   async revokeInvite(email) {
     // The dashboard never stores raw tokens beyond the create-invite
@@ -741,12 +940,33 @@ const Haven = {
       motion_threshold: parseFloat(document.getElementById('sys-motion-threshold').value),
       buffer_seconds: parseInt(document.getElementById('sys-buffer').value, 10),
       post_event_seconds: parseInt(document.getElementById('sys-post-event').value, 10),
+      retention_days: parseInt(document.getElementById('sys-retention-days').value, 10),
+      false_positive_retention_days: parseInt(document.getElementById('sys-fp-retention-days').value, 10),
     };
     const res = await fetch('/api/system-settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     if (!res.ok) { alert('Could not save (administrator access required).'); return; }
     const toast = document.getElementById('system-save-toast');
     toast.style.display = 'inline';
     setTimeout(() => toast.style.display = 'none', 3000);
+  },
+
+  // ---------------- Retention / cleanup (admin only) ----------------
+  async loadCleanupStatus() {
+    const res = await fetch('/api/admin/cleanup-status');
+    if (!res.ok) return;
+    const s = await res.json();
+    const el = document.getElementById('cleanup-status');
+    el.textContent = s.ran_at
+      ? `Last run: ${s.ran_at} · deleted ${s.deleted_events} incident(s), ${s.deleted_clips} clip(s)`
+      : 'Not run yet since this server started.';
+  },
+  async runCleanupNow() {
+    if (!this.state.isAdmin) return;
+    const el = document.getElementById('cleanup-status');
+    el.textContent = 'Running…';
+    const res = await fetch('/api/admin/run-cleanup', { method: 'POST' });
+    if (!res.ok) { el.textContent = 'Could not run cleanup (administrator access required).'; return; }
+    this.loadCleanupStatus();
   },
   uploadModel() {
     if (!this.state.isAdmin) return;

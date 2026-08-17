@@ -157,6 +157,8 @@
         <select id="filter-type" class="pill-input" onchange="Haven.renderIncidents()">
           <option value="all">All event types</option>
           <option value="Violence Detected">Violence Detected</option>
+          <option value="Fall Detected">Fall Detected</option>
+          <option value="Hazard Detected">Hazard Detected</option>
           <option value="Emergency">Emergency</option>
           <option value="Clip Ready">Clip Ready</option>
         </select>
@@ -229,6 +231,17 @@
             <span style="font-size:13px">Email</span>
             <button id="email-toggle" style="width:44px;height:24px;border-radius:999px;border:none;position:relative;cursor:pointer" onclick="Haven.toggleEmailChannel()"><span id="email-toggle-knob" style="position:absolute;top:3px;width:18px;height:18px;border-radius:999px;background:#fff;transition:left 0.15s"></span></button>
           </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0">
+            <span style="font-size:13px">Notification sound <span style="font-size:11px;color:rgba(43,26,8,0.5)">(plays in this browser tab when a new alert comes in)</span></span>
+            <button id="sound-toggle" style="width:44px;height:24px;border-radius:999px;border:none;position:relative;cursor:pointer" onclick="Haven.toggleSoundChannel()"><span id="sound-toggle-knob" style="position:absolute;top:3px;width:18px;height:18px;border-radius:999px;background:#fff;transition:left 0.15s"></span></button>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0">
+            <span style="font-size:13px">Desktop notification <span style="font-size:11px;color:rgba(43,26,8,0.5)">(OS pop-up while this tab is open, even in the background)</span></span>
+            <button id="desktop-toggle" style="width:44px;height:24px;border-radius:999px;border:none;position:relative;cursor:pointer" onclick="Haven.toggleDesktopChannel()"><span id="desktop-toggle-knob" style="position:absolute;top:3px;width:18px;height:18px;border-radius:999px;background:#fff;transition:left 0.15s"></span></button>
+          </div>
+          <div id="desktop-notif-warning" style="display:none;font-size:11px;color:#A6491C;background:#FBEFE6;border-radius:10px;padding:8px 12px;margin:2px 0 4px">
+            Your browser is blocking desktop notifications here because this page isn't loaded over HTTPS. The sound alert above still works regardless.
+          </div>
           <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;opacity:0.5">
             <span style="font-size:13px">SMS / WhatsApp <span style="font-size:11px;color:rgba(43,26,8,0.5)">(roadmap)</span></span>
             <button disabled style="width:44px;height:24px;border-radius:999px;border:none;background:#E1DBBE;position:relative;cursor:not-allowed"><span style="position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:999px;background:#fff"></span></button>
@@ -291,10 +304,20 @@
           </div>
           <div id="detection-defaults-note" class="disabled-note" style="margin-top:12px;display:none">Read-only for caregivers. Ask an administrator to change these.</div>
         </div>
+        <div id="retention-card" class="card" style="padding:22px 24px;margin-bottom:20px;display:none">
+          <h4 style="font-size:14px;margin:0 0 4px">Data retention</h4>
+          <p style="font-size:12px;color:rgba(43,26,8,0.55);margin:0 0 14px">Incident records and clip files older than "Keep incidents/clips for" are deleted automatically once a day. Incidents marked false positive have their <em>record</em> removed sooner, per the second setting -- but the video clip itself still follows the general window on the left, not the shorter one: clip files aren't reliably linked back to a specific incident in this codebase, so this can't safely delete "just that clip" sooner. If getting confirmed-noise video off disk faster matters more than keeping incident history, lower the setting on the left instead.</p>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:14px">
+            <div><label style="display:block;font-size:12px;color:rgba(43,26,8,0.6);margin-bottom:5px">Keep incidents/clips for (days)</label><input id="sys-retention-days" type="number" min="1" class="pill-input" style="width:100%;border-radius:12px"></div>
+            <div><label style="display:block;font-size:12px;color:rgba(43,26,8,0.6);margin-bottom:5px">Delete false-positive records after (days)</label><input id="sys-fp-retention-days" type="number" min="1" class="pill-input" style="width:100%;border-radius:12px"></div>
+          </div>
+          <button class="pill-btn pill-btn-outline" style="padding:9px 18px;font-size:13px" onclick="Haven.runCleanupNow()">Run cleanup now</button>
+          <span id="cleanup-status" style="font-size:12px;color:rgba(43,26,8,0.5);margin-left:12px"></span>
+        </div>
         <div id="invites-card" class="card" style="padding:22px 24px;margin-bottom:20px;display:none">
           <h4 style="font-size:14px;margin:0 0 4px">Team access</h4>
           <p style="font-size:12px;color:rgba(43,26,8,0.55);margin:0 0 14px">There is no self sign-up. Invite a new caregiver or admin here and share the one-time link it generates. The link expires in 7 days and can only be used once.</p>
-          <div style="display:grid;grid-template-columns:1.4fr 1fr 0.9fr auto;gap:10px;align-items:end;margin-bottom:14px">
+          <div style="display:grid;grid-template-columns:1.2fr 0.9fr 0.8fr 1.2fr auto;gap:10px;align-items:end;margin-bottom:14px">
             <div><label style="display:block;font-size:12px;color:rgba(43,26,8,0.6);margin-bottom:5px">Email</label><input id="invite-email" type="email" placeholder="name@havencare.org" class="pill-input" style="width:100%;border-radius:12px"></div>
             <div><label style="display:block;font-size:12px;color:rgba(43,26,8,0.6);margin-bottom:5px">Name</label><input id="invite-name" type="text" placeholder="Full name" class="pill-input" style="width:100%;border-radius:12px"></div>
             <div><label style="display:block;font-size:12px;color:rgba(43,26,8,0.6);margin-bottom:5px">Role</label>
@@ -303,12 +326,19 @@
                 <option value="admin">Admin</option>
               </select>
             </div>
+            <div><label style="display:block;font-size:12px;color:rgba(43,26,8,0.6);margin-bottom:5px">Rooms (caregiver only)</label><input id="invite-rooms" type="text" placeholder="Ward A, Ward B" class="pill-input" style="width:100%;border-radius:12px"></div>
             <button class="pill-btn pill-btn-primary" style="padding:11px 20px;font-size:13px;white-space:nowrap" onclick="Haven.createInvite()">Send invite</button>
           </div>
+          <p style="font-size:11px;color:rgba(43,26,8,0.5);margin:-8px 0 14px">A caregiver invited with no rooms listed will see NO cameras, incidents, or clips until you assign rooms -- this is intentional, not a bug. Admins always see every room regardless of this field.</p>
           <div id="invite-link-box" style="display:none;background:#FBF6DE;border-radius:12px;padding:12px 14px;font-size:12px;color:rgba(43,26,8,0.8);margin-bottom:14px;word-break:break-all"></div>
           <div id="invite-error" style="display:none;font-size:12px;color:#7A2E12;margin-bottom:14px"></div>
           <div style="font-size:12px;color:rgba(43,26,8,0.5);margin-bottom:8px">Pending invites</div>
           <div id="pending-invites-list" style="font-size:13px;color:rgba(43,26,8,0.75)"></div>
+        </div>
+        <div id="caregiver-rooms-card" class="card" style="padding:22px 24px;margin-bottom:20px;display:none">
+          <h4 style="font-size:14px;margin:0 0 4px">Caregiver room access</h4>
+          <p style="font-size:12px;color:rgba(43,26,8,0.55);margin:0 0 14px">Existing accounts. Edit rooms (comma-separated) and save to change what a caregiver can see. Admin accounts always see every room.</p>
+          <div id="caregiver-rooms-list" style="font-size:13px;color:rgba(43,26,8,0.75)"></div>
         </div>
         <div class="card" style="padding:22px 24px;margin-bottom:20px">
           <h4 style="font-size:14px;margin:0 0 12px">Camera health</h4>

@@ -13,11 +13,15 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from functools import wraps
 import json, os, cv2, time, secrets, hmac, uuid, re
+import threading
+
+from dashboard.retention import cleanup_events, cleanup_clips
 
 from auth.users import (
     verify_caregiver, get_caregiver_by_id,
     create_invite, get_valid_invite, consume_invite,
     list_pending_invites, revoke_invite, revoke_invite_by_email,
+    list_caregivers, set_assigned_rooms,
 )
 
 app = Flask(__name__)
@@ -90,10 +94,19 @@ class Caregiver(UserMixin):
         self.email = record["email"]
         self.name  = record.get("name", record["email"])
         self.role  = record.get("role", "caregiver")
+        self.assigned_rooms = record.get("assigned_rooms", [])
 
     @property
     def is_admin(self):
         return self.role == "admin"
+
+    def can_access_room(self, room):
+        # Admins see every room -- room scoping exists to keep a caregiver
+        # from seeing patients they have no care relationship with, not to
+        # limit facility-wide oversight. Missing/empty assigned_rooms means
+        # NO rooms, not "all rooms" -- see auth/users.py's create_caregiver
+        # for why that default is deliberate.
+        return self.is_admin or room in self.assigned_rooms
 
 
 @login_manager.user_loader
@@ -171,6 +184,15 @@ def load_cameras():
 def save_cameras(cameras):
     _write_json(CAMERAS_FILE, cameras)
 
+def _camera_room(cam_id):
+    """Room name for a camera id, or None if the camera doesn't exist.
+    Used to gate access to a specific camera's feed/score/clips by room,
+    since those routes only get a camera id, not a room, from the URL."""
+    for c in load_cameras():
+        if c["id"] == cam_id:
+            return c.get("room")
+    return None
+
 def load_profiles():
     return _read_json(PROFILES_FILE, {})
 
@@ -194,20 +216,36 @@ def save_announcements(items):
 def load_settings():
     return _read_json(SETTINGS_FILE, {
         "recipients": [], "threshold": 90, "cooldown": 120, "email_channel": True,
+        # Client-side chime in the dashboard tab when a new alert arrives.
+        # Purely a browser-side setting (no server-side sound to send), but
+        # stored here so it persists/syncs the same way email_channel does.
+        "sound_channel": True,
+        # OS-level desktop notification (Notification API) while the tab is
+        # open. Also purely client-side -- the server never sends anything
+        # for this channel, it just remembers the caregiver's preference.
+        # Requires a secure context (HTTPS or localhost) in the browser;
+        # see the warning dashboard.js surfaces when that isn't the case.
+        "desktop_channel": True,
     })
 
 def save_settings(s):
     _write_json(SETTINGS_FILE, s)
 
 def load_system_settings():
-    defaults = {"confirm_seconds": 3, "motion_threshold": 1.5, "buffer_seconds": 10, "post_event_seconds": 15}
+    defaults = {
+        "confirm_seconds": 3, "motion_threshold": 1.5, "buffer_seconds": 10, "post_event_seconds": 15,
+        # Retention: how long an incident record / clip file is kept
+        # before automatic deletion. false_positive_retention_days is
+        # shorter on purpose -- confirmed noise doesn't need the full
+        # window. See dashboard/retention.py.
+        "retention_days": 90,
+        "false_positive_retention_days": 7,
+    }
     if _cfg is not None:
-        defaults = {
-            "confirm_seconds": getattr(_cfg, "CONFIRM_SECONDS", defaults["confirm_seconds"]),
-            "motion_threshold": getattr(_cfg, "MOTION_THRESHOLD", defaults["motion_threshold"]),
-            "buffer_seconds": getattr(_cfg, "BUFFER_SECONDS", defaults["buffer_seconds"]),
-            "post_event_seconds": getattr(_cfg, "POST_EVENT_SECONDS", defaults["post_event_seconds"]),
-        }
+        defaults["confirm_seconds"]    = getattr(_cfg, "CONFIRM_SECONDS", defaults["confirm_seconds"])
+        defaults["motion_threshold"]   = getattr(_cfg, "MOTION_THRESHOLD", defaults["motion_threshold"])
+        defaults["buffer_seconds"]     = getattr(_cfg, "BUFFER_SECONDS", defaults["buffer_seconds"])
+        defaults["post_event_seconds"] = getattr(_cfg, "POST_EVENT_SECONDS", defaults["post_event_seconds"])
     stored = _read_json(SYS_SETTINGS_FILE, None)
     if stored:
         defaults.update(stored)
@@ -313,11 +351,22 @@ def index():
 @app.route("/video_feed/<cam_id>")
 @login_required
 def video_feed(cam_id):
+    room = _camera_room(cam_id)
+    # Deny, don't allow, when the camera id isn't in cameras.json (unknown,
+    # or deleted while its worker thread was still running/registered --
+    # see delete_camera). Room being None must never mean "no room check
+    # applies"; it must mean "can't prove access, so refuse." Matches
+    # _clip_room_accessible's default-deny for the same ambiguous case.
+    if room is None or not current_user.can_access_room(room):
+        return jsonify({"error": "not found"}), 404
     return Response(generate_frames(cam_id), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 @app.route("/api/score/<cam_id>")
 @login_required
 def get_score(cam_id):
+    room = _camera_room(cam_id)
+    if room is None or not current_user.can_access_room(room):
+        return jsonify({"error": "not found"}), 404
     worker = _workers.get(cam_id)
     return jsonify({"score": worker.score if worker else 0.0})
 
@@ -330,10 +379,16 @@ def get_me():
 # ---------------------------------------------------------------------------
 # Events / incidents
 # ---------------------------------------------------------------------------
+def _visible_events(events):
+    """Filter events to rooms current_user can access. Admins see all."""
+    if current_user.is_admin:
+        return events
+    return [e for e in events if e.get("room") in current_user.assigned_rooms]
+
 @app.route("/api/events")
 @login_required
 def get_events():
-    return jsonify(load_events()[-200:])
+    return jsonify(_visible_events(load_events())[-200:])
 
 @app.route("/api/events/add", methods=["POST"])
 @internal_key_required
@@ -352,6 +407,7 @@ def add_event():
         "confidence": data.get("confidence", 0.0),
         "clip_path":  data.get("clip_path", ""),
         "states":     data.get("states", []),  # snapshot of tracked-person states at alert time
+        "detail":     data.get("detail", ""),  # free-text rule explanation (e.g. hazard events)
         "notes":      "",
         "reviewed":   False,
         "false_positive": False,
@@ -364,6 +420,8 @@ def add_event():
 def get_incident(incident_id):
     for e in load_events():
         if e.get("id") == incident_id:
+            if not current_user.can_access_room(e.get("room")):
+                return jsonify({"error": "not found"}), 404
             return jsonify(e)
     return jsonify({"error": "not found"}), 404
 
@@ -374,6 +432,8 @@ def set_incident_notes(incident_id):
     events = load_events()
     for e in events:
         if e.get("id") == incident_id:
+            if not current_user.can_access_room(e.get("room")):
+                return jsonify({"error": "not found"}), 404
             e["notes"] = data.get("notes", "")
             save_events(events)
             return jsonify({"status": "ok"})
@@ -385,6 +445,8 @@ def toggle_incident_review(incident_id):
     events = load_events()
     for e in events:
         if e.get("id") == incident_id:
+            if not current_user.can_access_room(e.get("room")):
+                return jsonify({"error": "not found"}), 404
             e["reviewed"] = not e.get("reviewed", False)
             save_events(events)
             return jsonify({"status": "ok", "reviewed": e["reviewed"]})
@@ -396,6 +458,8 @@ def toggle_incident_false_positive(incident_id):
     events = load_events()
     for e in events:
         if e.get("id") == incident_id:
+            if not current_user.can_access_room(e.get("room")):
+                return jsonify({"error": "not found"}), 404
             e["false_positive"] = not e.get("false_positive", False)
             save_events(events)
             return jsonify({"status": "ok", "false_positive": e["false_positive"]})
@@ -415,6 +479,8 @@ def toggle_incident_false_positive(incident_id):
 @login_required
 def get_cameras():
     cameras = load_cameras()
+    if not current_user.is_admin:
+        cameras = [c for c in cameras if current_user.can_access_room(c.get("room"))]
     for c in cameras:
         c.setdefault("patients", 0)
         c.setdefault("priority", "Medium")
@@ -446,6 +512,16 @@ def add_camera():
 def delete_camera(cam_id):
     cameras = [c for c in load_cameras() if c["id"] != cam_id]
     save_cameras(cameras)
+    # Unregister the running worker (if any) so /video_feed and /api/score
+    # for this id stop being servable the instant the camera is deleted --
+    # without this, a worker thread started at process launch keeps
+    # capturing and streaming after its camera record is gone, and the
+    # dashboard has no route left that will show it as "Offline" to warn
+    # anyone. This does not stop the worker's background thread itself
+    # (CameraWorker has no stop/join mechanism yet -- a real fix, tracked
+    # as follow-up work, not something to improvise here); it does close
+    # off every access path to what that thread is still capturing.
+    _workers.pop(cam_id, None)
     return jsonify({"status": "ok"})
 
 @app.route("/api/cameras/update/<cam_id>", methods=["POST"])
@@ -465,9 +541,30 @@ def update_camera(cam_id):
 # ---------------------------------------------------------------------------
 _CLIP_NAME_RE = re.compile(r"^alert_(?P<cam>.+)_(?P<ts>\d{8}_\d{6})\.mp4$")
 
+def _clip_room_accessible(filename):
+    """A clip's filename encodes its camera id, not its room, so this maps
+    camera_id -> room via the current camera list. If the camera was since
+    deleted (orphaned clip) or the filename doesn't match the expected
+    pattern, default to admin-only -- we can't verify a caregiver's
+    assignment against a room we can't determine, and defaulting to
+    "visible" for anything ambiguous would defeat the point of this check.
+    """
+    if current_user.is_admin:
+        return True
+    m = _CLIP_NAME_RE.match(filename)
+    if not m:
+        return False
+    cam_id = m.group("cam")
+    room = _camera_room(cam_id)
+    if room is None:
+        return False
+    return current_user.can_access_room(room)
+
 @app.route("/clips/<filename>")
 @login_required
 def serve_clip(filename):
+    if not _clip_room_accessible(filename):
+        return jsonify({"error": "not found"}), 404
     return send_from_directory(str(CLIPS_DIR.absolute()), filename)
 
 @app.route("/api/clips")
@@ -475,7 +572,9 @@ def serve_clip(filename):
 def get_clips():
     clips = sorted(CLIPS_DIR.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
     out = []
-    for c in clips[:100]:
+    for c in clips:
+        if not _clip_room_accessible(c.name):
+            continue
         m = _CLIP_NAME_RE.match(c.name)
         out.append({
             "filename": c.name,
@@ -483,6 +582,8 @@ def get_clips():
             "timestamp": m.group("ts") if m else "",
             "mtime": c.stat().st_mtime,
         })
+        if len(out) >= 100:
+            break
     return jsonify(out)
 
 
@@ -560,6 +661,10 @@ def update_settings():
         s["cooldown"] = max(30, min(300, int(data["cooldown"])))
     if "email_channel" in data:
         s["email_channel"] = bool(data["email_channel"])
+    if "sound_channel" in data:
+        s["sound_channel"] = bool(data["sound_channel"])
+    if "desktop_channel" in data:
+        s["desktop_channel"] = bool(data["desktop_channel"])
     save_settings(s)
     return jsonify({"status": "ok"})
 
@@ -592,7 +697,7 @@ def test_alert():
 @login_required
 def get_analytics():
     days = max(1, min(90, int(request.args.get("days", 7))))
-    events = load_events()
+    events = _visible_events(load_events())
     cutoff = datetime.now() - timedelta(days=days)
 
     def parsed(e):
@@ -638,6 +743,75 @@ def get_analytics():
 
 
 # ---------------------------------------------------------------------------
+# Retention -- age-based cleanup of incident records and clip files. See
+# dashboard/retention.py for the actual deletion logic; this is just the
+# wiring (settings-driven windows, a manual admin trigger, and a daily
+# background pass so this doesn't rely on someone remembering to click a
+# button).
+# ---------------------------------------------------------------------------
+_last_cleanup_result = None
+
+def run_cleanup():
+    """Runs one cleanup pass using the currently configured retention
+    windows. Safe to call from a request handler or a background thread --
+    does not touch anything the room-scoping/auth layer cares about (this
+    operates on the full, unscoped event/clip stores, same as CameraWorker
+    writing to them)."""
+    global _last_cleanup_result
+    s = load_system_settings()
+    retention_days = s.get("retention_days", 90)
+    fp_retention_days = s.get("false_positive_retention_days", 7)
+
+    events = load_events()
+    kept, deleted_events = cleanup_events(events, retention_days, fp_retention_days)
+    if deleted_events:
+        save_events(kept)
+
+    deleted_clips = cleanup_clips(CLIPS_DIR, retention_days)
+
+    _last_cleanup_result = {
+        "ran_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "deleted_events": deleted_events,
+        "deleted_clips": deleted_clips,
+        "retention_days": retention_days,
+        "false_positive_retention_days": fp_retention_days,
+    }
+    return _last_cleanup_result
+
+
+def start_retention_thread(interval_seconds=24 * 60 * 60):
+    """Starts a daemon thread that runs cleanup once immediately, then
+    once per interval_seconds. Call this explicitly from a real entry
+    point (this file's __main__ block, or src/main.py) -- NOT at module
+    import time, so importing dashboard.app (e.g. in tests, which reload
+    this module fresh per test) never spawns a background thread that
+    outlives the test and keeps touching a temp directory that's about
+    to be torn down."""
+    def _loop():
+        while True:
+            try:
+                run_cleanup()
+            except Exception as e:
+                print(f"[RETENTION] Cleanup pass failed, will retry next interval: {e}")
+            time.sleep(interval_seconds)
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    return t
+
+
+@app.route("/api/admin/run-cleanup", methods=["POST"])
+@admin_required
+def trigger_cleanup():
+    return jsonify({"status": "ok", **run_cleanup()})
+
+
+@app.route("/api/admin/cleanup-status")
+@admin_required
+def cleanup_status():
+    return jsonify(_last_cleanup_result or {"ran_at": None})
+
+
+# ---------------------------------------------------------------------------
 # Invites -- admin-only. Creating an invite is the only way a new sign-up
 # link comes into existence; nothing here lets a caller pick their own
 # token or bypass the admin_required check.
@@ -655,8 +829,11 @@ def add_invite():
     email = (data.get("email") or "").strip()
     name  = (data.get("name") or "").strip()
     role  = data.get("role", "caregiver")
+    assigned_rooms = data.get("assigned_rooms") or []
+    if not isinstance(assigned_rooms, list):
+        assigned_rooms = []
     try:
-        invite = create_invite(email, name, role, invited_by=current_user.email)
+        invite = create_invite(email, name, role, invited_by=current_user.email, assigned_rooms=assigned_rooms)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     link = url_for("signup", token=invite["token"], _external=True)
@@ -665,6 +842,7 @@ def add_invite():
         "link": link,
         "email": invite["email"],
         "role": invite["role"],
+        "assigned_rooms": invite["assigned_rooms"],
         "expires_at": invite["expires_at"],
     })
 
@@ -679,6 +857,31 @@ def delete_invite(token):
 def delete_invite_by_email(email):
     ok = revoke_invite_by_email(email)
     return jsonify({"status": "ok" if ok else "not found"}), (200 if ok else 404)
+
+
+# ---------------------------------------------------------------------------
+# Caregiver room access -- admin-only. Existing accounts (created before
+# room scoping existed, or via the CLI without --rooms) default to seeing
+# NO rooms, not every room -- see auth/users.py's create_caregiver for why.
+# This is how an admin fixes that for an account after the fact, without
+# having to delete and re-invite them.
+# ---------------------------------------------------------------------------
+@app.route("/api/caregivers")
+@admin_required
+def get_caregivers():
+    return jsonify(list_caregivers())
+
+@app.route("/api/caregivers/<email>/rooms", methods=["POST"])
+@admin_required
+def update_caregiver_rooms(email):
+    data = request.json or {}
+    rooms = data.get("assigned_rooms")
+    if not isinstance(rooms, list):
+        return jsonify({"error": "assigned_rooms must be a list of room names"}), 400
+    updated = set_assigned_rooms(email, rooms)
+    if not updated:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"status": "ok", "email": email, "assigned_rooms": updated.get("assigned_rooms", [])})
 
 
 # ---------------------------------------------------------------------------
@@ -701,6 +904,10 @@ def update_system_settings():
             s[key] = int(data[key])
     if "motion_threshold" in data:
         s["motion_threshold"] = float(data["motion_threshold"])
+    if "retention_days" in data:
+        s["retention_days"] = max(1, int(data["retention_days"]))
+    if "false_positive_retention_days" in data:
+        s["false_positive_retention_days"] = max(1, int(data["false_positive_retention_days"]))
     save_system_settings(s)
     return jsonify({"status": "ok"})
 
@@ -725,4 +932,5 @@ def upload_model():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    start_retention_thread()
     app.run(host="0.0.0.0", port=port, debug=False)
