@@ -1,0 +1,90 @@
+/* src/dashboard/static/css/haven.css
+   Design tokens and shared rules for the Haven-style caregiver dashboard.
+   Colors and spacing are pulled directly from the approved design so the
+   built app matches it, not an approximation of it. */
+
+@import url('https://fonts.googleapis.com/css2?family=Bitter:wght@500;700&family=Figtree:wght@400;500;600&display=swap');
+
+:root {
+  --ink: #2B1A08;
+  --ink-soft: rgba(43, 26, 8, 0.65);
+  --ink-faint: rgba(43, 26, 8, 0.5);
+  --paper: #F7F5E9;
+  --gold: #C9A227;
+  --gold-soft: #FBF6DE;
+  --sidebar: #2E2B1B;
+  --sidebar-ink: #F7F5E9;
+  --state-normal-bg: #EAF0DE;   --state-normal-fg: #405221;   --state-normal-dot: #6D8B3E;
+  --state-proximate-bg: #FBF6DE; --state-proximate-fg: #7C6212; --state-proximate-dot: #C9A227;
+  --state-agitated-bg: #F5EAB4;  --state-agitated-fg: #7C6212;  --state-agitated-dot: #A3811A;
+  --state-fighting-bg: #F3D9C8;  --state-fighting-fg: #7A2E12;  --state-fighting-dot: #A6491C;
+  --state-onground-bg: #EAD2C4;  --state-onground-fg: #5C2409;  --state-onground-dot: #7A2E12;
+  --state-emergency-bg: #3D1200; --state-emergency-fg: #FBEFE6; --state-emergency-dot: #FBEFE6;
+  --priority-high-bg: #F3D9C8;   --priority-high-fg: #7A2E12;
+  --priority-medium-bg: #FBF6DE; --priority-medium-fg: #7C6212;
+  --priority-low-bg: #EAF0DE;    --priority-low-fg: #405221;
+  --type-violence-bg: #F3D9C8;   --type-violence-fg: #7A2E12;
+  --type-emergency-bg: #3D1200;  --type-emergency-fg: #FBEFE6;
+  --type-clipready-bg: #EAF0DE;  --type-clipready-fg: #405221;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; font-family: 'Figtree', system-ui, sans-serif; color: var(--ink); background: var(--paper); }
+::selection { background: rgba(201, 162, 39, 0.35); }
+:focus { outline: none; }
+:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+input::placeholder, textarea::placeholder { color: rgba(43, 26, 8, 0.4); }
+
+.display-font { font-family: 'Bitter', Georgia, serif; font-weight: 500; }
+
+@keyframes havenPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+@keyframes havenSlide { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+a { color: inherit; }
+button { font-family: inherit; }
+
+/* Sidebar nav buttons */
+.nav-btn {
+  display: flex; align-items: center; gap: 12px; width: 100%; text-align: left;
+  background: none; color: var(--sidebar-ink); border: none; padding: 11px 12px;
+  border-radius: 14px; font-size: 14px; cursor: pointer; margin-bottom: 4px;
+  font-family: 'Figtree', sans-serif; opacity: 0.75;
+}
+.nav-btn .dot { width: 8px; height: 8px; border-radius: 999px; background: currentColor; opacity: 0.7; flex: none; }
+.nav-btn.active { background: rgba(247, 245, 233, 0.12); opacity: 1; }
+.nav-btn:hover { opacity: 1; }
+
+.card { background: #fff; border: 1px solid rgba(43, 26, 8, 0.1); border-radius: 20px; }
+.pill-input {
+  padding: 10px 16px; border-radius: 999px; border: 1px solid rgba(43, 26, 8, 0.18);
+  background: #fff; font-size: 13px; font-family: inherit;
+}
+.pill-btn {
+  border: none; border-radius: 999px; padding: 10px 18px; font-size: 13px; cursor: pointer; font-family: inherit;
+}
+.pill-btn-primary { background: var(--gold); color: var(--ink); }
+.pill-btn-outline { background: none; border: 1px solid rgba(43, 26, 8, 0.2); color: var(--ink); }
+.pill-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.hover-lift { transition: transform 0.2s, box-shadow 0.2s; }
+.hover-lift:hover { transform: translateY(-8px); box-shadow: 0 24px 40px rgba(43, 26, 8, 0.28); }
+
+.clip-placeholder {
+  aspect-ratio: 16/9; border-radius: 20px;
+  background: repeating-linear-gradient(135deg, #EFEBD3, #EFEBD3 12px, #E7E1C4 12px, #E7E1C4 24px);
+  display: flex; align-items: center; justify-content: center;
+}
+.clip-thumb { aspect-ratio: 16/10; border-radius: 16px;
+  background: repeating-linear-gradient(135deg, #EFEBD3, #EFEBD3 12px, #E7E1C4 12px, #E7E1C4 24px);
+  display: flex; align-items: center; justify-content: center; margin-bottom: 8px;
+}
+
+.disabled-note { font-size: 11px; color: rgba(43, 26, 8, 0.5); }
+
+.modal-backdrop {
+  position: fixed; inset: 0; background: rgba(46, 43, 27, 0.5);
+  display: flex; align-items: center; justify-content: center; padding: 20px; z-index: 50;
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: rgba(43, 26, 8, 0.2); border-radius: 999px; }

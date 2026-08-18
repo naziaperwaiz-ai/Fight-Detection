@@ -40,9 +40,23 @@ class CameraWorker:
 
         # model
         self.model = ViolenceClassifier()
-        self.model.load_state_dict(
-            torch.load(config.MODEL_PATH, map_location=self.device)
-        )
+        # weights_only=True restricts unpickling to tensors/plain data,
+        # not arbitrary Python objects -- a .pt file is a pickle archive by
+        # default, and loading one with weights_only=False (the old
+        # default) lets a malicious model file execute arbitrary code the
+        # moment it's loaded. Model uploads are admin-only in this app, but
+        # "trusted admin" doesn't mean "attacker never gets a file past
+        # them" -- fail loudly rather than silently falling back to the
+        # unsafe path on older torch versions.
+        try:
+            state_dict = torch.load(config.MODEL_PATH, map_location=self.device, weights_only=True)
+        except TypeError:
+            raise RuntimeError(
+                "This torch version does not support weights_only=True. "
+                "Upgrade torch (>=1.13) before loading model weights -- "
+                "loading with weights_only=False is a code-execution risk."
+            )
+        self.model.load_state_dict(state_dict)
         self.model.to(self.device)
         self.model.eval()
         print(f"[{config.CAMERA_ID}] Model loaded on {self.device}")
@@ -51,6 +65,32 @@ class CameraWorker:
         from detection.state_machine import StateMachine
         self.detector     = PersonDetector(device="cpu")
         self.state_machine = StateMachine(config)
+
+        # Hazard detection (dangerous-object-near-wrist rule) is opt-in.
+        # Object detection for it (knife/scissors/fork) rides along on
+        # PersonDetector's existing per-frame pass -- see detector.py's
+        # extra_classes param -- rather than a second full detector
+        # model, since class filtering is near-free on an already-
+        # running forward pass. Only the pose model is a genuinely
+        # separate network, so it's the only one still owned and
+        # throttled here. See detection/hazard.py.
+        self.hazard_detector  = None
+        self._hazard_class_map = None
+        self._hazard_frame_count = 0
+        if getattr(config, "HAZARD_DETECTION_ENABLED", False):
+            from detection.hazard import HazardDetector, hazard_class_map
+            min_severity = getattr(config, "HAZARD_MIN_SEVERITY", "high")
+            self._hazard_class_map = hazard_class_map(min_severity)
+            self.hazard_detector = HazardDetector(
+                pose_weights=getattr(config, "HAZARD_POSE_WEIGHTS", "yolov8n-pose.pt"),
+                device="cpu",
+                proximity_frac=getattr(config, "HAZARD_PROXIMITY_FRAC", 0.06),
+                min_consecutive=getattr(config, "HAZARD_MIN_CONSECUTIVE", 2),
+                imgsz=getattr(config, "HAZARD_IMGSZ", 320),
+            )
+            print(f"[{config.CAMERA_ID}] Hazard detection enabled "
+                  f"(min_severity={min_severity}, classes={self._hazard_class_map}, "
+                  f"imgsz={getattr(config, 'HAZARD_IMGSZ', 320)})")
 
         self.transform = T.Compose([
             T.ToPILImage(),
@@ -128,9 +168,66 @@ class CameraWorker:
                 break
 
             self.buffer.append(frame.copy())
-            detections = self.detector.detect(frame)
+            # When hazard detection is on, knife/scissors/fork classes
+            # ride along on this same pass (extra_classes) instead of a
+            # second full-frame detector -- see detector.py. Falls back
+            # to the plain single-list return when hazard is off, so the
+            # hot path is unchanged for anyone not using this feature.
+            if self.hazard_detector is not None:
+                detections, hazard_objects = self.detector.detect(frame, extra_classes=self._hazard_class_map)
+            else:
+                detections, hazard_objects = self.detector.detect(frame), []
             score      = self._predict(frame, detections)
             self.state_machine.update_all(detections)
+
+            # Hazard detection (dangerous object near a wrist) -- the
+            # object-detection part above already happened essentially
+            # for free (piggybacked on person detection). What's still
+            # throttled here is the pose model, a genuinely separate and
+            # slower network, and only when there's actually a candidate
+            # object to check a wrist against.
+            if self.hazard_detector is not None:
+                self._hazard_frame_count += 1
+                sample_every = max(1, getattr(self.cfg, "HAZARD_SAMPLE_EVERY_N_FRAMES", 5))
+                if hazard_objects and self._hazard_frame_count % sample_every == 0:
+                    try:
+                        hazard_events = self.hazard_detector.check_objects(frame, hazard_objects)
+                    except Exception as e:
+                        # Don't let a transient inference error (e.g. a
+                        # malformed frame, or a first-run weight download
+                        # hiccup) take down the whole camera thread -- skip
+                        # this sample and keep going, same as the alert
+                        # POSTs below already do for network failures.
+                        print(f"[{self.cfg.CAMERA_ID}] Hazard check failed, skipping sample: {e}")
+                        hazard_events = []
+                    for ev in hazard_events:
+                        now = time.time()
+                        if (now - self.last_alert_time) > self.cfg.COOLDOWN_SECONDS:
+                            self.last_alert_time = now
+                            label = f"Hazard Detected: {ev['object']}"
+                            print(f"[{self.cfg.CAMERA_ID}] {label} "
+                                  f"(conf={ev['detection_conf']}, {ev['detail']})")
+                            self.notifier.send_alert(
+                                self.cfg.CAMERA_ID, self.cfg.ROOM_NAME,
+                                label, ev["detection_conf"], "Check camera immediately"
+                            )
+                            try:
+                                requests.post(
+                                    f"{self.cfg.DASHBOARD_URL}/api/events/add",
+                                    json={
+                                        "camera_id":  self.cfg.CAMERA_ID,
+                                        "room":       self.cfg.ROOM_NAME,
+                                        "event_type": "Hazard Detected",
+                                        "confidence": ev["detection_conf"],
+                                        "clip_path":  "",
+                                        "detail": (f"{ev['object']} ({ev['severity']} severity) "
+                                                   f"-- {ev['detail']}"),
+                                    },
+                                    headers={"X-Internal-Key": getattr(self.cfg, "INTERNAL_API_KEY", "")},
+                                    timeout=0.5
+                                )
+                            except:
+                                pass
             frame      = self.detector.draw(frame, detections)
             self.score = score
             self.violence_scores.append(score)
@@ -155,6 +252,14 @@ class CameraWorker:
                     self.cfg.CAMERA_ID, self.cfg.ROOM_NAME,
                     "Violence Detected", avg_score, "Saving..."
                 )
+                # Snapshot each currently-tracked person's state/score so the
+                # dashboard's incident detail view can show real "people
+                # tracked" data instead of nothing -- this is genuinely
+                # available in state_machine at the moment the alert fires.
+                states_snapshot = [
+                    {"track_id": tid, "state": track.state, "score": track.avg_score()}
+                    for tid, track in self.state_machine.tracks.items()
+                ]
                 try:
                     requests.post(
                         f"{self.cfg.DASHBOARD_URL}/api/events/add",
@@ -163,8 +268,11 @@ class CameraWorker:
                             "room":       self.cfg.ROOM_NAME,
                             "event_type": "Violence Detected",
                             "confidence": avg_score,
-                            "clip_path":  "Saving..."
-                        }, timeout=0.5
+                            "clip_path":  "Saving...",
+                            "states":     states_snapshot
+                        },
+                        headers={"X-Internal-Key": getattr(self.cfg, "INTERNAL_API_KEY", "")},
+                        timeout=0.5
                     )
                 except:
                     pass
@@ -210,8 +318,82 @@ class CameraWorker:
                     self.last_alert_time = now
                     self.notifier.send_alert(
                         self.cfg.CAMERA_ID, self.cfg.ROOM_NAME,
-                        "EMERGENCY — Person Down 30s", 1.0, "Check camera immediately"
+                        "EMERGENCY - Person Down 30s", 1.0, "Check camera immediately"
                     )
+                    # This used to only send an email -- it never reached the
+                    # dashboard's incident history, so Emergency events were
+                    # invisible in the UI. Log it the same way as the other
+                    # alert types so it shows up in Incident history/Analytics.
+                    emergency_states = [
+                        {"track_id": tid, "state": track.state, "score": track.avg_score()}
+                        for tid, track in self.state_machine.tracks.items()
+                    ]
+                    try:
+                        requests.post(
+                            f"{self.cfg.DASHBOARD_URL}/api/events/add",
+                            json={
+                                "camera_id":  self.cfg.CAMERA_ID,
+                                "room":       self.cfg.ROOM_NAME,
+                                "event_type": "Emergency",
+                                "confidence": 1.0,
+                                "clip_path":  "",
+                                "states":     emergency_states
+                            },
+                            headers={"X-Internal-Key": getattr(self.cfg, "INTERNAL_API_KEY", "")},
+                            timeout=0.5
+                        )
+                    except:
+                        pass
+
+            # fall escalation -- independent of the violence pipeline above.
+            # See state_machine.py's _update_fall for the rule and its
+            # caveats. Shares the same cooldown clock as the other alert
+            # types deliberately: it's one alerting budget per camera, not
+            # a separate one per event type.
+            if self.state_machine.has_fall():
+                now = time.time()
+                if (now - self.last_alert_time) > self.cfg.COOLDOWN_SECONDS:
+                    self.last_alert_time = now
+                    print(f"[{self.cfg.CAMERA_ID}] FALL DETECTED (geometry rule, not a model score)")
+                    self.notifier.send_alert(
+                        self.cfg.CAMERA_ID, self.cfg.ROOM_NAME,
+                        "Fall Detected", 1.0, "Check camera immediately"
+                    )
+                    fall_states = [
+                        {"track_id": tid, "state": track.state,
+                         "fall_status": track.fall_status, "score": track.avg_score()}
+                        for tid, track in self.state_machine.tracks.items()
+                    ]
+                    try:
+                        requests.post(
+                            f"{self.cfg.DASHBOARD_URL}/api/events/add",
+                            json={
+                                "camera_id":  self.cfg.CAMERA_ID,
+                                "room":       self.cfg.ROOM_NAME,
+                                "event_type": "Fall Detected",
+                                # 1.0 here is "the geometry rule fired", not a
+                                # model probability -- same convention as the
+                                # Emergency event above. Do not read this as
+                                # equivalent to the violence classifier's score.
+                                "confidence": 1.0,
+                                "clip_path":  "",
+                                "states":     fall_states
+                            },
+                            headers={"X-Internal-Key": getattr(self.cfg, "INTERNAL_API_KEY", "")},
+                            timeout=0.5
+                        )
+                    except:
+                        pass
+
+            # draw fall status per person (separate from the violence-state
+            # label already drawn above, since a person can be Normal
+            # violence-wise and mid-fall at the same time)
+            for tid, track in self.state_machine.tracks.items():
+                if track.fall_status != "None" and track.bbox_history:
+                    x1, y1, x2, y2 = track.bbox_history[-1]
+                    fall_color = (0, 140, 255) if track.fall_status == "Suspected" else (0, 0, 255)
+                    cv2.putText(frame, f"FALL:{track.fall_status}", (x1, max(0, y1 - 25)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, fall_color, 2)
 
             self._set_frame(frame)
 
@@ -250,7 +432,9 @@ class CameraWorker:
                     "event_type": "Clip Ready",
                     "confidence": 0.0,
                     "clip_path":  out_path
-                }, timeout=0.5
+                },
+                headers={"X-Internal-Key": getattr(self.cfg, "INTERNAL_API_KEY", "")},
+                timeout=0.5
             )
         except:
             pass

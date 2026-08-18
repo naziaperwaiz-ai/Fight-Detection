@@ -24,6 +24,20 @@ class PersonTrack:
         self.bbox_history  = []   # last N bboxes for aspect ratio check
         self.score_history = []   # last N violence scores
 
+        # Fall detection is intentionally a SEPARATE signal from `state`
+        # above. `state` tracks violence escalation (Normal -> ... ->
+        # Fighting -> OnGround -> Emergency), which requires a violence
+        # score first -- a person who trips with no altercation never
+        # enters that chain. fall_status is a parallel, independent rule:
+        # "did this person's bounding box collapse in height and stay
+        # horizontal", with no dependency on the violence classifier at
+        # all. A person can be Normal (violence-wise) and FallConfirmed
+        # (fall-wise) at the same time -- that's the correct behavior.
+        self.height_history     = []   # (timestamp, bbox_height) samples, last few seconds
+        self.fall_status        = "None"   # "None" | "Suspected" | "Confirmed"
+        self.fall_status_since  = time.time()
+        self.fall_recovery_since = None    # when they stopped being horizontal, while still Confirmed
+
     def time_in_state(self):
         return time.time() - self.state_since
 
@@ -55,6 +69,30 @@ class PersonTrack:
         w = x2 - x1
         h = y2 - y1
         return w > h if h > 0 else False
+
+    def update_height(self, bbox):
+        """Record (timestamp, bbox_height) for the fall-collapse check.
+
+        Kept separate from bbox_history (which is frame-count-bounded and
+        used by is_horizontal/drawing) because the fall rule needs a
+        time-bounded window regardless of frame rate.
+        """
+        x1, y1, x2, y2 = bbox
+        now = time.time()
+        self.height_history.append((now, y2 - y1))
+        cutoff = now - 6.0   # generous: covers lookback + confirm + margin
+        self.height_history = [(t, h) for t, h in self.height_history if t >= cutoff]
+
+    def reference_standing_height(self, lookback_seconds):
+        """Max bbox height seen in the recent window, excluding the last
+        0.5s so a fall already in progress can't be used as its own
+        "was standing" baseline."""
+        now = time.time()
+        candidates = [
+            h for t, h in self.height_history
+            if 0.5 < (now - t) <= lookback_seconds
+        ]
+        return max(candidates) if candidates else 0.0
 
 
 class StateMachine:
@@ -98,12 +136,91 @@ class StateMachine:
                     proximate.append((id1, id2))
         return proximate
 
+    def _update_fall(self, track):
+        """Rule-based fall detection, independent of the violence pipeline.
+
+        Rule: bbox height collapses to <= FALL_HEIGHT_DROP_RATIO of its
+        recent "standing" reference height, and the bbox stays wider-than-
+        tall (is_horizontal) continuously for FALL_CONFIRM_SECONDS.
+
+        This is deliberately the same style as hazard_detect.py: a plain
+        geometric rule on top of the already-running person detector, not
+        a trained classifier. There is no labelled fall dataset anywhere
+        in this project (RLVS/SCVD/UCF-Crime are all violence clips), so
+        there is nothing to validate precision/recall against -- treat
+        fall_status as a triage signal, not a scored model output.
+
+        Known false-positive sources: sitting down quickly, bending down,
+        a pet or object crossing the detector, or a camera angle where
+        "wider than tall" doesn't correspond to lying down (e.g. a
+        near-overhead mount). Tune FALL_* config per camera placement.
+        """
+        cfg          = self.cfg
+        drop_ratio   = getattr(cfg, "FALL_HEIGHT_DROP_RATIO", 0.5)
+        lookback     = getattr(cfg, "FALL_LOOKBACK_SECONDS", 2.0)
+        confirm_secs = getattr(cfg, "FALL_CONFIRM_SECONDS", 2.0)
+        min_height   = getattr(cfg, "FALL_MIN_BBOX_HEIGHT", 40)
+        recovery_secs = 3.0
+
+        if not track.height_history:
+            return
+        now, cur_height = track.height_history[-1]
+
+        # A too-small/noisy box can't be positively read as "collapsed" or
+        # "still horizontal" -- but it must NOT short-circuit the whole
+        # function, or a track stuck Confirmed (e.g. partially occluded
+        # while down) would never reach the recovery branch below and
+        # would re-alert forever. Treat "too small to judge" as "not
+        # horizontal": it can't start a new Suspected fall, and it lets
+        # an existing Confirmed fall decay back to None via the normal
+        # recovery timer instead of freezing.
+        too_small  = cur_height < min_height
+        ref_height = 0.0 if too_small else track.reference_standing_height(lookback)
+        collapsed  = (not too_small) and ref_height > 0 and cur_height <= ref_height * drop_ratio
+        horizontal = (not too_small) and track.is_horizontal()
+
+        if track.fall_status == "None":
+            if collapsed and horizontal:
+                track.fall_status       = "Suspected"
+                track.fall_status_since = now
+
+        elif track.fall_status == "Suspected":
+            # Same brief-occlusion tolerance as the Confirmed branch below,
+            # via the same fall_recovery_since field (the two states are
+            # mutually exclusive, so reusing it is safe). Without this, one
+            # noisy not-horizontal sample mid-window -- furniture or another
+            # person briefly crossing the box -- hard-reset progress to
+            # "None" and a genuine fall could never accumulate confirm_secs
+            # of "mostly horizontal" time.
+            if horizontal:
+                track.fall_recovery_since = None
+                if now - track.fall_status_since >= confirm_secs:
+                    track.fall_status = "Confirmed"
+            else:
+                if track.fall_recovery_since is None:
+                    track.fall_recovery_since = now
+                elif now - track.fall_recovery_since > recovery_secs:
+                    track.fall_status         = "None"
+                    track.fall_recovery_since = None
+
+        elif track.fall_status == "Confirmed":
+            if horizontal:
+                track.fall_recovery_since = None
+            else:
+                if track.fall_recovery_since is None:
+                    track.fall_recovery_since = now
+                elif now - track.fall_recovery_since > recovery_secs:
+                    track.fall_status         = "None"
+                    track.fall_recovery_since = None
+
     def update(self, track_id, score, bbox, frame):
         """Update state for one tracked person."""
         track = self._get_or_create(track_id)
         track.last_seen = time.time()
         track.update_bbox(bbox)
         track.update_score(score)
+        track.update_height(bbox)
+        self._update_fall(track)
 
         avg = track.avg_score()
 
@@ -169,3 +286,6 @@ class StateMachine:
 
     def has_fighting(self):
         return any(t.state == PersonState.FIGHTING for t in self.tracks.values())
+
+    def has_fall(self):
+        return any(t.fall_status == "Confirmed" for t in self.tracks.values())
