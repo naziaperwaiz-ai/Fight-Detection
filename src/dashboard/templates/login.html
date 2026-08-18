@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Haven - Sign in</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/haven.css') }}">
+</head>
+<body>
+
+<div style="font-family:Figtree,system-ui,sans-serif;color:#2B1A08;background:#F7F5E9;min-height:100vh">
+
+  <section style="min-height:100vh;display:flex;flex-direction:column;justify-content:center;padding:120px 8vw 90px;position:relative;background:#F7F5E9">
+    <div style="display:flex;align-items:center;gap:10px;position:absolute;top:36px;left:8vw">
+      <div style="width:34px;height:34px;border-radius:999px;background:#C9A227"></div>
+      <span class="display-font" style="font-size:22px">Haven</span>
+    </div>
+    <a href="#login" style="position:absolute;top:40px;right:8vw;font-size:14px;color:#2B1A08;text-decoration:none;border:1px solid rgba(43,26,8,0.2);padding:8px 18px;border-radius:999px;white-space:nowrap">Sign in</a>
+
+    <div style="display:flex;flex-direction:column-reverse;gap:56px;max-width:1200px;margin:0 auto;width:100%">
+      <div style="max-width:640px;text-align:center;margin:0 auto">
+        <span style="display:inline-block;font-size:11px;letter-spacing:0.1em;text-transform:uppercase;color:#7C6212;background:#FBF6DE;padding:6px 14px;border-radius:999px;margin-bottom:20px">Elder &amp; memory care monitoring</span>
+        <h1 class="display-font" style="font-weight:500;font-size:56px;line-height:1.08;margin:0 auto 20px;max-width:11ch">Watch over them, gently.</h1>
+        <p style="font-size:18px;line-height:1.6;color:rgba(43,26,8,0.75);max-width:46ch;margin:0 auto 32px">Haven detects agitation, altercations and dangerous objects on camera in real time, and tells the right caregiver before it becomes an emergency.</p>
+        <a href="#login" class="display-font" style="display:inline-flex;align-items:center;gap:8px;background:#C9A227;color:#2B1A08;font-size:15px;padding:14px 26px;border-radius:999px;text-decoration:none">Sign in to your ward</a>
+      </div>
+
+      <div style="display:flex;gap:18px;justify-content:center;flex-wrap:wrap">
+        <div class="hover-lift" style="width:220px;flex:none;border-radius:26px;overflow:hidden;background:#D4C04D;box-shadow:0 16px 32px rgba(43,26,8,0.2)">
+          <div style="padding:16px 16px 0">
+            <div style="display:flex;justify-content:space-between;font-size:10px;color:#291100;opacity:0.75;margin-bottom:10px"><span>16:54</span><span>&#9612;&#9612;&#9612;&#9632;</span></div>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" style="margin-bottom:14px"><path d="M15 5l-7 7 7 7" stroke="#291100" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+            <div class="display-font" style="text-align:center;font-size:15px;color:#291100;margin-bottom:12px">My Zones</div>
+            <div style="display:flex;justify-content:center;gap:5px;margin-bottom:16px">
+              <span style="font-size:10px;padding:5px 10px;border-radius:999px;background:#291100;color:#F5EAB4">Today</span>
+              <span style="font-size:10px;padding:5px 10px;border-radius:999px;color:#291100;opacity:0.7">Weekly</span>
+              <span style="font-size:10px;padding:5px 10px;border-radius:999px;color:#291100;opacity:0.7">Monthly</span>
+            </div>
+            <div style="display:flex;justify-content:center"><img src="{{ url_for('static', filename='img/illustration-zones.png') }}" style="width:110px;height:auto;display:block"></div>
+          </div>
+          <div style="background:#fff;border-radius:22px 22px 0 0;margin-top:-14px;padding:18px 18px;position:relative">
+            <div style="font-size:12px;font-weight:600;color:#291100;margin-bottom:4px">Sunroom Wing</div>
+            <div style="display:flex;gap:5px;margin-bottom:12px"><span style="width:7px;height:7px;border-radius:999px;background:#657733"></span><span style="width:7px;height:7px;border-radius:999px;background:#657733"></span><span style="width:7px;height:7px;border-radius:999px;background:#657733"></span><span style="width:7px;height:7px;border-radius:999px;background:#E1DBBE"></span></div>
+            <div style="font-size:12px;font-weight:600;color:#291100;margin-bottom:4px">Rehab Wing</div>
+            <div style="display:flex;gap:5px;margin-bottom:12px"><span style="width:7px;height:7px;border-radius:999px;background:#657733"></span><span style="width:7px;height:7px;border-radius:999px;background:#657733"></span><span style="width:7px;height:7px;border-radius:999px;background:#E1DBBE"></span><span style="width:7px;height:7px;border-radius:999px;background:#E1DBBE"></span></div>
+            <div style="font-size:12px;font-weight:600;color:#291100;margin-bottom:4px">Memory Suite</div>
+            <div style="display:flex;gap:5px"><span style="width:7px;height:7px;border-radius:999px;background:#A6491C"></span><span style="width:7px;height:7px;border-radius:999px;background:#E1DBBE"></span><span style="width:7px;height:7px;border-radius:999px;background:#E1DBBE"></span><span style="width:7px;height:7px;border-radius:999px;background:#E1DBBE"></span></div>
+          </div>
+        </div>
+
+        <div class="hover-lift" style="width:220px;flex:none;border-radius:26px;overflow:hidden;background:#ECF5E2;box-shadow:0 16px 32px rgba(43,26,8,0.2)">
+          <div style="padding:16px 16px 0">
+            <div style="display:flex;justify-content:space-between;font-size:10px;color:#291100;opacity:0.75;margin-bottom:10px"><span>16:54</span><span>&#9612;&#9612;&#9612;&#9632;</span></div>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" style="margin-bottom:14px"><path d="M15 5l-7 7 7 7" stroke="#291100" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+            <div class="display-font" style="text-align:center;font-size:15px;color:#291100;margin-bottom:12px">My Goals</div>
+            <div style="display:flex;justify-content:center;gap:5px;margin-bottom:16px">
+              <span style="font-size:10px;padding:5px 10px;border-radius:999px;background:#291100;color:#ECF5E2">Today</span>
+              <span style="font-size:10px;padding:5px 10px;border-radius:999px;color:#291100;opacity:0.7">Weekly</span>
+              <span style="font-size:10px;padding:5px 10px;border-radius:999px;color:#291100;opacity:0.7">Monthly</span>
+            </div>
+            <div style="display:flex;justify-content:center"><img src="{{ url_for('static', filename='img/illustration-goals.png') }}" style="width:110px;height:auto;display:block"></div>
+          </div>
+          <div style="background:#fff;border-radius:22px 22px 0 0;margin-top:-14px;padding:18px 18px">
+            <div style="font-size:12px;font-weight:600;color:#291100;margin-bottom:2px">My progress</div>
+            <div style="font-size:11px;color:rgba(43,26,8,0.6);margin-bottom:10px">0 incidents / per shift</div>
+            <div style="font-size:11px;color:rgba(43,26,8,0.55);margin-bottom:12px">All 12 patients accounted for as of 8:00 PM.</div>
+            <div style="display:flex;gap:5px"><span style="width:7px;height:7px;border-radius:999px;background:#657733"></span><span style="width:7px;height:7px;border-radius:999px;background:#657733"></span><span style="width:7px;height:7px;border-radius:999px;background:#657733"></span><span style="width:7px;height:7px;border-radius:999px;background:#657733"></span><span style="width:7px;height:7px;border-radius:999px;background:#657733"></span></div>
+          </div>
+        </div>
+
+        <div class="hover-lift" style="width:220px;flex:none;border-radius:26px;overflow:hidden;background:#D7E3A4;box-shadow:0 16px 32px rgba(43,26,8,0.2)">
+          <div style="padding:16px 16px 0">
+            <div style="display:flex;justify-content:space-between;font-size:10px;color:#291100;opacity:0.75;margin-bottom:10px"><span>16:54</span><span>&#9612;&#9612;&#9612;&#9632;</span></div>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" style="margin-bottom:6px"><path d="M15 5l-7 7 7 7" stroke="#291100" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+            <div class="display-font" style="text-align:center;font-size:15px;color:#291100">Daily report</div>
+            <div style="text-align:center;font-size:11px;color:rgba(43,26,8,0.6);margin-bottom:14px">Today</div>
+            <div style="display:flex;justify-content:center"><img src="{{ url_for('static', filename='img/illustration-daily-report.png') }}" style="width:110px;height:auto;display:block"></div>
+          </div>
+          <div style="background:#fff;border-radius:22px 22px 0 0;margin-top:-4px;padding:18px 18px 42px">
+            <div style="font-size:12px;font-weight:600;color:#291100;margin-bottom:8px">My activities</div>
+            <div style="display:flex;gap:6px;margin-bottom:10px">
+              <span style="font-size:10px;padding:5px 10px;border-radius:999px;border:1px solid rgba(43,26,8,0.2);color:#291100;white-space:nowrap;flex-shrink:0">Rounds</span>
+              <span style="font-size:10px;padding:5px 10px;border-radius:999px;border:1px solid rgba(43,26,8,0.2);color:#291100;white-space:nowrap;flex-shrink:0">Meds</span>
+              <span style="font-size:10px;padding:5px 10px;border-radius:999px;background:#291100;color:#D7E3A4;white-space:nowrap;flex-shrink:0">Check-in</span>
+            </div>
+            <div style="font-size:11px;color:rgba(43,26,8,0.55)">3 rounds completed &middot; next at 22:00</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div style="position:absolute;bottom:36px;left:0;right:0;display:flex;flex-direction:column;align-items:center;gap:6px;color:rgba(43,26,8,0.5);font-size:12px">
+      <span>Scroll down to sign in</span>
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 6l5 5 5-5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+    </div>
+  </section>
+
+  <section id="login" style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:48px;background:#2E2B1B">
+    <div style="width:min(420px,100%);background:#F7F5E9;border-radius:28px;padding:40px 36px;box-shadow:0 12px 32px rgba(0,0,0,0.3)">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:28px">
+        <div style="width:28px;height:28px;border-radius:999px;background:#C9A227"></div>
+        <span class="display-font" style="font-size:18px">Haven</span>
+      </div>
+      <h2 class="display-font" style="font-weight:500;font-size:24px;margin:0 0 6px">Sign in</h2>
+      <p style="font-size:13px;color:rgba(43,26,8,0.6);margin:0 0 24px">Caregiver access &middot; Fight Detection System</p>
+
+      {% if error %}
+      <div style="background:#F3D9C8;color:#7A2E12;font-size:13px;padding:10px 14px;border-radius:12px;margin-bottom:16px">{{ error }}</div>
+      {% endif %}
+
+      <form method="POST" action="{{ url_for('login', next=request.args.get('next', '')) }}">
+        <div style="margin-bottom:14px">
+          <label for="email" style="display:block;font-size:12px;color:rgba(43,26,8,0.65);margin-bottom:6px">Email</label>
+          <input id="email" name="email" type="email" autocomplete="username" required autofocus placeholder="ayesha@havencare.org" style="width:100%;padding:12px 16px;font-size:14px;border:1px solid rgba(43,26,8,0.18);border-radius:999px;background:#fff">
+        </div>
+        <div style="margin-bottom:10px">
+          <label for="password" style="display:block;font-size:12px;color:rgba(43,26,8,0.65);margin-bottom:6px">Password</label>
+          <div style="position:relative">
+            <input id="password" name="password" type="password" autocomplete="current-password" required placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" style="width:100%;padding:12px 44px 12px 16px;font-size:14px;border:1px solid rgba(43,26,8,0.18);border-radius:999px;background:#fff">
+            <button type="button" onclick="haventogglePw()" style="position:absolute;top:10px;right:6px;width:34px;background:none;border:none;color:rgba(43,26,8,0.55);font-size:12px;cursor:pointer">
+              <span id="pw-toggle-label">Show</span>
+            </button>
+          </div>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:rgba(43,26,8,0.7);margin:14px 0 22px;cursor:pointer">
+          <input type="checkbox" name="remember"> Remember me on this device
+        </label>
+        <button type="submit" class="display-font" style="width:100%;background:#C9A227;color:#2B1A08;font-size:15px;padding:13px;border-radius:999px;border:none;cursor:pointer">Sign in</button>
+      </form>
+      <div style="margin-top:18px;font-size:13px;color:rgba(43,26,8,0.45)">Access is restricted to provisioned caregiver accounts. Contact your administrator if you need one.</div>
+    </div>
+  </section>
+</div>
+
+<script>
+function haventogglePw() {
+  const el = document.getElementById('password');
+  const label = document.getElementById('pw-toggle-label');
+  const showing = el.type === 'text';
+  el.type = showing ? 'password' : 'text';
+  label.textContent = showing ? 'Show' : 'Hide';
+}
+</script>
+</body>
+</html>

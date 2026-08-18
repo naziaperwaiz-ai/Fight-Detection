@@ -1,0 +1,9 @@
+[
+  {
+    "id": "CAM-01",
+    "room": "Ward A",
+    "source": "0",
+    "threshold": 0.7,
+    "active": true
+  }
+]
