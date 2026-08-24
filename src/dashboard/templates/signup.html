@@ -30,6 +30,7 @@
       {% endif %}
 
       <form method="POST" action="{{ url_for('signup', token=token) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="token" value="{{ token }}">
         <div style="margin-bottom:14px">
           <label style="display:block;font-size:12px;color:rgba(43,26,8,0.65);margin-bottom:6px">Email</label>

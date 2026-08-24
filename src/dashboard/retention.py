@@ -4,20 +4,19 @@
 # windows:
 #   - retention_days: how long ANY incident record / clip file is kept.
 #   - false_positive_retention_days: a shorter window for incidents
-#     already marked false_positive. Confirmed noise doesn't need the
+#     already marked false_positive. Confirmed noise does not need the
 #     full retention window, and getting rid of it sooner reduces how
-#     much patient video sits on disk with no ongoing purpose -- that's
-#     the whole point of this file existing.
+#     much patient video sits on disk with no ongoing purpose.
 #
 # Clip files and incident records are cleaned up independently, each by
 # its own timestamp (clip file mtime; an incident's own "timestamp"
-# field), not cross-referenced. That's a deliberate simplification: the
+# field), not cross-referenced. This is a deliberate simplification: the
 # alert event's clip_path is set to the placeholder string "Saving..."
 # when the incident is first logged and is never retroactively updated
 # once the real clip exists (a separate "Clip Ready" event carries the
-# real path) -- so trying to precisely delete "this incident's clip"
-# would be building on a link that's already unreliable elsewhere in
-# this codebase, not something this cleanup pass should paper over.
+# real path), so precisely deleting "this incident's clip" would be
+# building on a link that is already unreliable elsewhere in this
+# codebase, and this cleanup pass does not try to paper over that.
 
 import time
 from datetime import datetime
@@ -34,9 +33,9 @@ def _event_age_days(event, now):
 def cleanup_events(events, retention_days, false_positive_retention_days, now=None):
     """Returns (kept_events, deleted_count).
 
-    An event whose timestamp can't be parsed is kept, not deleted -- we
-    don't guess an age for it, and erring toward keeping unparseable
-    records is safer than erring toward silently destroying them.
+    An event whose timestamp cannot be parsed is kept, not deleted. Its
+    age is not guessed, and erring toward keeping unparseable records is
+    safer than erring toward silently destroying them.
     """
     now = now or datetime.now()
     kept = []
@@ -64,11 +63,11 @@ def cleanup_clips(clips_dir, retention_days, now_ts=None):
         try:
             age_days = (now_ts - f.stat().st_mtime) / 86400.0
         except OSError:
-            continue  # file removed between glob() and stat() -- fine, skip it
+            continue  # file removed between glob() and stat(); skip it
         if age_days > retention_days:
             try:
                 f.unlink()
                 deleted += 1
             except OSError:
-                pass  # already gone, or a permissions issue -- don't crash cleanup over one file
+                pass  # already gone, or a permissions issue; don't crash cleanup over one file
     return deleted

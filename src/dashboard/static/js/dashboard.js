@@ -4,6 +4,25 @@
 // relevant section. Matches the pattern already used by this project
 // before this rewrite (see the old index.html's inline script).
 
+// CSRF: app.py wraps every mutating route with Flask-WTF's CSRFProtect,
+// which expects the token on a header for JSON/fetch requests (form POSTs
+// carry it as a hidden field instead; see login.html/signup.html). Rather
+// than threading a header option through every individual fetch() call
+// below (easy to add to nine call sites today and forget on the tenth
+// tomorrow), this wraps window.fetch once, at load time, so every
+// mutating request this file makes is protected by construction.
+(() => {
+  const token = document.getElementById('haven-root')?.dataset.csrfToken || '';
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = (input, init = {}) => {
+    const method = (init.method || 'GET').toUpperCase();
+    if (method !== 'GET' && method !== 'HEAD') {
+      init = { ...init, headers: { ...(init.headers || {}), 'X-CSRFToken': token } };
+    }
+    return nativeFetch(input, init);
+  };
+})();
+
 const STATUS_STYLE = {
   Normal:    { bg: '#EAF0DE', fg: '#405221', dot: '#6D8B3E' },
   Elevated:  { bg: '#F5EAB4', fg: '#7C6212', dot: '#A3811A' },
@@ -71,6 +90,7 @@ const Haven = {
     document.addEventListener('click', () => this._unlockAudio(), { once: true });
     await Promise.all([this.loadCameras(), this.loadEvents(), this.loadSettings()]);
     this.loadAnnouncements();
+    this.loadLastCheckin();
     document.getElementById('dash-greet-name').textContent = (root.dataset.caregiverName || '').split(' ')[0];
     this.goPage('dashboard');
     setInterval(() => this.loadEvents(), 15000);
@@ -310,6 +330,36 @@ const Haven = {
     this.loadAnnouncements();
   },
 
+  // ---------------- Round check-ins ----------------
+  // Two entry points on the dashboard trigger the exact same check-in
+  // (POST /api/checkins/add): the "Round check-in" Quick action card and
+  // the "Let's start your shift" card above it. Both write status text
+  // into their own element (qa-checkin-status / shift-start-checkin-
+  // status respectively) via _setCheckinStatusText, since a page can't
+  // have two elements sharing one id.
+  _setCheckinStatusText(text) {
+    ['qa-checkin-status', 'shift-start-checkin-status'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = text;
+    });
+  },
+  async roundCheckin() {
+    this._setCheckinStatusText('Logging...');
+    try {
+      const res = await fetch('/api/checkins/add', { method: 'POST' });
+      if (!res.ok) throw new Error('request failed');
+    } catch (e) {
+      this._setCheckinStatusText("Couldn't log check-in -- try again");
+      return;
+    }
+    this.loadLastCheckin();
+  },
+  async loadLastCheckin() {
+    const res = await fetch('/api/checkins/last');
+    const last = await res.json();
+    this._setCheckinStatusText(last ? `Last check-in: ${last.timestamp.slice(11, 16)}` : 'No check-in yet this shift');
+  },
+
   // ---------------- Dashboard (home) ----------------
   zoneStatusFor(room) {
     const now = Date.now();
@@ -367,6 +417,7 @@ const Haven = {
     const offlineCams = this.state.cameras.filter(c => c.active && c.liveStatus === 'Offline').length;
     document.getElementById('qa-open-incidents-tag').textContent = `${openIncidents} open`;
     document.getElementById('qa-offline-cams-tag').textContent = `${offlineCams} offline`;
+    this.loadLastCheckin();
 
     // Active alert banner: an unresolved Violence/Fall/Hazard/Emergency event in the last 10 minutes.
     const now = Date.now();
@@ -431,8 +482,8 @@ const Haven = {
       const bg = isLive ? '#EAF0DE' : '#F3D9C8', fg = isLive ? '#405221' : '#7A2E12';
       const previewOpen = this.state.openPreviews.has(cam.id);
       const editDeleteButtons = this.state.isAdmin ? `
-          <button class="pill-btn pill-btn-outline" style="padding:8px 16px;font-size:12px" onclick="Haven.editCamera('${cam.id}')">Edit</button>
-          <button class="pill-btn" style="padding:8px 16px;font-size:12px;background:none;border:1px solid #A6491C;color:#A6491C" onclick="Haven.requestDeleteCamera('${cam.id}')">Delete</button>` : '';
+          <button class="pill-btn pill-btn-outline" style="padding:8px 16px;font-size:12px" data-action="edit-camera" data-cam-id="${esc(cam.id)}">Edit</button>
+          <button class="pill-btn" style="padding:8px 16px;font-size:12px;background:none;border:1px solid #A6491C;color:#A6491C" data-action="delete-camera" data-cam-id="${esc(cam.id)}">Delete</button>` : '';
       return `
       <div class="card" style="padding:16px 22px">
         <div style="display:flex;align-items:center;gap:16px">
@@ -448,7 +499,7 @@ const Haven = {
           </div>
           <span style="font-size:12px;background:${bg};color:${fg};padding:6px 14px;border-radius:999px;flex:none">${cam.liveStatus}</span>
           <div style="display:flex;gap:6px;flex:none">
-            <button class="pill-btn pill-btn-outline" style="padding:8px 16px;font-size:12px" ${isLive ? '' : 'disabled title="Camera is offline, no feed to preview"'} onclick="Haven.togglePreview('${cam.id}')">${previewOpen ? 'Hide preview' : 'Preview'}</button>${editDeleteButtons}
+            <button class="pill-btn pill-btn-outline" style="padding:8px 16px;font-size:12px" ${isLive ? '' : 'disabled title="Camera is offline, no feed to preview"'} data-action="toggle-preview" data-cam-id="${esc(cam.id)}">${previewOpen ? 'Hide preview' : 'Preview'}</button>${editDeleteButtons}
           </div>
         </div>
         ${previewOpen ? `
@@ -472,7 +523,15 @@ const Haven = {
   },
 
   openAddCamera() {
-    this.state.editingCamera = { id: `CAM-${String(this.state.cameras.length + 1).padStart(2, '0')}`, room: '', source: '', threshold: 0.9, active: true, patients: 0, priority: 'Medium', isNew: true };
+    // Pre-fill from the facility-wide Alert Settings threshold (0-100,
+    // percent) rather than a hardcoded 0.9, so a caregiver who has
+    // already tuned the global alert sensitivity gets that same
+    // sensitivity by default on a new camera instead of always starting
+    // from 90%. Falls back to 0.9 if settings have not loaded yet.
+    const defaultThreshold = this.state.settings && typeof this.state.settings.threshold === 'number'
+      ? this.state.settings.threshold / 100
+      : 0.9;
+    this.state.editingCamera = { id: `CAM-${String(this.state.cameras.length + 1).padStart(2, '0')}`, room: '', source: '', threshold: defaultThreshold, active: true, patients: 0, priority: 'Medium', hazard_enabled: false, isNew: true };
     this._openCameraModal('Add camera');
   },
   editCamera(id) {
@@ -491,6 +550,7 @@ const Haven = {
     document.getElementById('cam-patients').value = ec.patients || 0;
     document.getElementById('cam-priority').value = ec.priority || 'Medium';
     document.getElementById('cam-active').checked = !!ec.active;
+    document.getElementById('cam-hazard').checked = !!ec.hazard_enabled;
     document.getElementById('camera-modal-backdrop').style.display = 'flex';
   },
   closeCameraModal() {
@@ -507,6 +567,7 @@ const Haven = {
       patients: parseInt(document.getElementById('cam-patients').value || '0', 10),
       priority: document.getElementById('cam-priority').value,
       active: document.getElementById('cam-active').checked,
+      hazard_enabled: document.getElementById('cam-hazard').checked,
     };
     if (!payload.id || !payload.room || !payload.source) { alert('Fill in camera ID, room, and source.'); return; }
 
@@ -570,7 +631,7 @@ const Haven = {
             <span style="font-size:15px;font-weight:600">${esc(inc.camera_id)}</span>
             <span style="font-size:13px;color:rgba(43,26,8,0.6)">${esc(inc.room)}</span>
           </div>
-          <div style="font-size:12px;color:rgba(43,26,8,0.5)">${esc(inc.timestamp)} &middot; ${inc.clip_path ? 'Clip available' : 'No clip'}${inc.reviewed ? ' &middot; Reviewed' : ''}</div>
+          <div style="font-size:12px;color:rgba(43,26,8,0.5)">${esc(inc.timestamp)} &middot; ${hasReadyClip(inc.clip_path) ? 'Clip available' : (inc.clip_path ? 'Clip saving&hellip;' : 'No clip')}${inc.reviewed ? ' &middot; Reviewed' : ''}</div>
         </div>
         <span style="font-size:12px;background:${style.bg};color:${style.fg};padding:6px 14px;border-radius:999px;flex:none">${esc(inc.event_type)}</span>
         <span class="display-font" style="font-size:16px;color:#A3811A;flex:none;width:56px;text-align:right">${pct}%</span>
@@ -610,8 +671,11 @@ const Haven = {
       <div style="display:grid;grid-template-columns:1.3fr 1fr;gap:24px">
         <div>
           <div class="clip-placeholder" style="margin-bottom:20px">
-            ${inc.clip_path ? `<a href="/clips/${esc(inc.clip_path.split('/').pop())}" target="_blank" style="font-size:13px;color:#A3811A">&#9654; Open clip</a>`
-                             : `<span style="font-family:monospace;font-size:12px;color:rgba(43,26,8,0.5)">No clip recorded for this incident</span>`}
+            ${hasReadyClip(inc.clip_path)
+                ? `<a href="/clips/${encodeURIComponent(inc.clip_path.split('/').pop())}" target="_blank" style="font-size:13px;color:#A3811A">&#9654; Open clip</a>`
+                : inc.clip_path
+                    ? `<span style="font-family:monospace;font-size:12px;color:rgba(43,26,8,0.5)">Clip is still being saved &mdash; check back in a few seconds, or look for the matching "Clip Ready" entry in Incident history.</span>`
+                    : `<span style="font-family:monospace;font-size:12px;color:rgba(43,26,8,0.5)">No clip recorded for this incident</span>`}
           </div>
           <h4 style="font-size:14px;margin:0 0 14px">People tracked at alert time</h4>
           <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:24px">
@@ -839,7 +903,8 @@ const Haven = {
     document.getElementById('retention-card').style.display = isAdmin ? 'block' : 'none';
     document.getElementById('invites-card').style.display = isAdmin ? 'block' : 'none';
     document.getElementById('caregiver-rooms-card').style.display = isAdmin ? 'block' : 'none';
-    if (isAdmin) { this.loadInvites(); this.loadCaregiverRooms(); this.loadCleanupStatus(); }
+    document.getElementById('checkin-history-card').style.display = isAdmin ? 'block' : 'none';
+    if (isAdmin) { this.loadInvites(); this.loadCaregiverRooms(); this.loadCleanupStatus(); this.loadCheckinHistory(); }
 
     const health = document.getElementById('camera-health-list');
     health.innerHTML = this.state.cameras.map(cam => `
@@ -847,6 +912,20 @@ const Haven = {
         <span>${esc(cam.id)} &middot; ${esc(cam.room)}</span>
         <span style="color:${cam.liveStatus === 'Live' ? '#405221' : '#7A2E12'}">${cam.liveStatus}</span>
       </div>`).join('');
+  },
+
+  // ---------------- Round check-in history (admin only; server also enforces this) ----------------
+  async loadCheckinHistory() {
+    const list = document.getElementById('checkin-history-list');
+    if (!list) return;
+    const res = await fetch('/api/checkins');
+    if (!res.ok) { list.innerHTML = '<div style="font-size:13px;color:rgba(43,26,8,0.5)">Unable to load check-in history.</div>'; return; }
+    const checkins = await res.json();
+    list.innerHTML = checkins.map(c => `
+      <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(43,26,8,0.08);font-size:13px">
+        <span>${esc(c.caregiver_name)} &middot; ${esc(Array.isArray(c.rooms) ? (c.rooms.join(', ') || 'no rooms assigned') : c.rooms)}</span>
+        <span style="color:rgba(43,26,8,0.6)">${esc(c.timestamp)}</span>
+      </div>`).join('') || '<div style="font-size:13px;color:rgba(43,26,8,0.5)">No check-ins logged yet.</div>';
   },
 
   // ---------------- Invites (admin only; server also enforces this) ----------------
@@ -858,7 +937,7 @@ const Haven = {
     list.innerHTML = invites.map(inv => `
       <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid rgba(43,26,8,0.08)">
         <span>${esc(inv.email)} &middot; ${esc(inv.role)} &middot; invited by ${esc(inv.invited_by)}</span>
-        <button class="pill-btn pill-btn-outline" style="padding:4px 12px;font-size:11px" onclick="Haven.revokeInvite('${esc(inv.email)}')">Revoke</button>
+        <button class="pill-btn pill-btn-outline" style="padding:4px 12px;font-size:11px" data-action="revoke-invite" data-email="${esc(inv.email)}">Revoke</button>
       </div>`).join('') || '<div style="font-size:13px;color:rgba(43,26,8,0.5)">No pending invites.</div>';
     // Keep tokens around client-side only long enough to revoke by email;
     // the list endpoint deliberately never returns tokens, so revoke below
@@ -893,15 +972,35 @@ const Haven = {
   },
 
   // ---------------- Caregiver room access (admin only) ----------------
+  //
+  // Room assignment used to be a free-text "Ward A, Ward B" field, typed
+  // separately from wherever a camera's actual room name was set. Room
+  // access (can_access_room in app.py) is an exact, case-sensitive string
+  // match against that text -- so "room 1" typed here against a camera
+  // whose room is "Room 1" produces a caregiver who is silently granted
+  // zero rooms: no error anywhere, "No cameras yet" on their Cameras
+  // page (identical wording to genuinely having no cameras), and no
+  // incidents ever shown, with nothing in the UI to reveal why. This now
+  // renders one checkbox per room name that actually exists on a real
+  // camera (from this.state.cameras, already loaded for admins), so a
+  // typo can't happen -- the only names offered are ones that exist.
   async loadCaregiverRooms() {
     const res = await fetch('/api/caregivers');
     if (!res.ok) return;
     const caregivers = await res.json();
+    const knownRooms = [...new Set(this.state.cameras.map(c => c.room).filter(Boolean))].sort();
     const list = document.getElementById('caregiver-rooms-list');
     list.innerHTML = caregivers.map(u => {
       const isAdminAcct = u.role === 'admin';
-      const rooms = (u.assigned_rooms || []).join(', ');
-      const inputId = `rooms-${esc(u.email).replace(/[^a-zA-Z0-9]/g, '_')}`;
+      const assigned = new Set(u.assigned_rooms || []);
+      const groupId = `rooms-${esc(u.email).replace(/[^a-zA-Z0-9]/g, '_')}`;
+      const checkboxes = knownRooms.length
+        ? knownRooms.map((room, i) => `
+            <label style="display:flex;align-items:center;gap:5px;font-size:12px;font-weight:400;cursor:pointer">
+              <input type="checkbox" id="${groupId}-${i}" value="${esc(room)}" ${assigned.has(room) ? 'checked' : ''}>
+              ${esc(room)}
+            </label>`).join('')
+        : '<span style="font-size:12px;color:#C15A1C">No cameras configured yet -- add one on the Cameras page before assigning rooms.</span>';
       return `
       <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid rgba(43,26,8,0.08)">
         <div style="min-width:0">
@@ -910,15 +1009,15 @@ const Haven = {
         </div>
         ${isAdminAcct
           ? `<span style="font-size:12px;color:rgba(43,26,8,0.5);flex:none">Sees every room</span>`
-          : `<div style="display:flex;gap:8px;align-items:center;flex:none">
-               <input id="${inputId}" type="text" value="${esc(rooms)}" placeholder="Ward A, Ward B" class="pill-input" style="width:220px;border-radius:12px;font-size:12px;${rooms ? '' : 'border-color:#C15A1C'}">
-               <button class="pill-btn pill-btn-outline" style="padding:4px 12px;font-size:11px" onclick="Haven.saveCaregiverRooms('${esc(u.email)}','${inputId}')">Save</button>
+          : `<div style="display:flex;gap:12px;align-items:center;flex:none;flex-wrap:wrap;max-width:340px;justify-content:flex-end">
+               ${checkboxes}
+               <button class="pill-btn pill-btn-outline" style="padding:4px 12px;font-size:11px" data-action="save-caregiver-rooms" data-email="${esc(u.email)}" data-group-id="${esc(groupId)}">Save</button>
              </div>`}
       </div>`;
     }).join('') || '<div style="font-size:13px;color:rgba(43,26,8,0.5)">No accounts yet.</div>';
   },
-  async saveCaregiverRooms(email, inputId) {
-    const rooms = document.getElementById(inputId).value.split(',').map(r => r.trim()).filter(Boolean);
+  async saveCaregiverRooms(email, groupId) {
+    const rooms = Array.from(document.querySelectorAll(`input[id^="${groupId}-"]:checked`)).map(cb => cb.value);
     const res = await fetch(`/api/caregivers/${encodeURIComponent(email)}/rooms`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ assigned_rooms: rooms }),
@@ -986,10 +1085,56 @@ const Haven = {
   },
 };
 
+// CameraWorker posts an incident the instant an alert fires, with
+// clip_path set to this literal placeholder -- the clip itself hasn't
+// finished recording/encoding yet. A second, separate "Clip Ready"
+// incident is posted later (see pipeline.py's _save_clip) once the real
+// file exists, with the real filename as clip_path. Until that second
+// incident shows up, this incident's clip_path is still "Saving..." --
+// not a real filename -- so treating it as one and linking to
+// /clips/Saving... 404s (the "Bad URL" a caregiver sees clicking an
+// alert before its matching Clip Ready entry appears). Every render
+// that turns clip_path into a link or an "available" status must check
+// this first.
+const CLIP_SAVING_PLACEHOLDER = "Saving...";
+function hasReadyClip(clipPath) {
+  return !!clipPath && clipPath !== CLIP_SAVING_PLACEHOLDER;
+}
+
 function esc(str) {
+  // Escapes for both HTML text-node content AND HTML attribute-value
+  // context (the div/textContent round trip below only covers &, <, >,
+  // since a text node never needs to escape quote characters -- but
+  // several call sites interpolate this into a quoted attribute, e.g.
+  // value="${esc(x)}", where an unescaped " or ' would still terminate
+  // the attribute early). Escaping both quote characters here makes esc()
+  // safe for attribute-value context too.
   const div = document.createElement('div');
   div.textContent = str === undefined || str === null ? '' : String(str);
-  return div.innerHTML;
+  return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
+
+// Delegated click handling for data-driven actions (edit/delete a camera,
+// toggle a preview, revoke an invite, save a caregiver's room list).
+// These used to be built as onclick="Haven.method('${value}')" strings
+// with the value interpolated directly into markup -- which means that
+// value became part of the JavaScript source the browser compiles for
+// that handler. HTML-escaping (even a hardened esc()) cannot make that
+// safe: inline event-handler attributes are HTML-entity-decoded BEFORE
+// being parsed as JS, so an entity-escaped quote decodes back into a
+// literal quote by the time the JS engine sees it and still breaks out
+// of the string. Reading the value from a data-* attribute instead never
+// treats it as JS source at all, so there is nothing to break out of.
+document.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-action]');
+  if (!el) return;
+  switch (el.dataset.action) {
+    case 'edit-camera':          return Haven.editCamera(el.dataset.camId);
+    case 'delete-camera':        return Haven.requestDeleteCamera(el.dataset.camId);
+    case 'toggle-preview':       return Haven.togglePreview(el.dataset.camId);
+    case 'revoke-invite':        return Haven.revokeInvite(el.dataset.email);
+    case 'save-caregiver-rooms': return Haven.saveCaregiverRooms(el.dataset.email, el.dataset.groupId);
+  }
+});
 
 document.addEventListener('DOMContentLoaded', () => Haven.init());

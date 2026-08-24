@@ -8,7 +8,7 @@
 </head>
 <body>
 
-<div id="haven-root" style="display:flex;min-height:100vh" data-is-admin="{{ '1' if is_admin else '0' }}" data-caregiver-name="{{ caregiver_name }}">
+<div id="haven-root" style="display:flex;min-height:100vh" data-is-admin="{{ '1' if is_admin else '0' }}" data-caregiver-name="{{ caregiver_name }}" data-csrf-token="{{ csrf_token() }}">
   <aside style="width:236px;flex:none;background:#2E2B1B;color:#F7F5E9;display:flex;flex-direction:column;padding:24px 16px;position:sticky;top:0;height:100vh;overflow-y:auto">
     <div style="display:flex;align-items:center;gap:10px;padding:0 8px;margin-bottom:32px">
       <div style="width:26px;height:26px;border-radius:999px;background:#C9A227"></div>
@@ -49,9 +49,10 @@
       <div style="display:grid;grid-template-columns:1.5fr 1fr;gap:24px;align-items:start">
         <div>
           <div style="display:flex;gap:14px;margin-bottom:24px;flex-wrap:wrap">
-            <div style="flex:1;min-width:220px;background:#D4C04D;border-radius:24px;padding:26px 28px;position:relative;overflow:hidden;min-height:150px">
+            <div class="hover-lift" role="button" tabindex="0" onclick="Haven.roundCheckin()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();Haven.roundCheckin();}" style="flex:1;min-width:220px;background:#D4C04D;border-radius:24px;padding:26px 28px;position:relative;overflow:hidden;min-height:150px;cursor:pointer">
               <h3 class="display-font" style="font-weight:500;font-size:19px;margin:0 0 8px;color:#291100;max-width:65%">Let's start your shift</h3>
-              <p style="font-size:13px;color:rgba(41,17,0,0.75);margin:0;max-width:60%">Begin with a walk-through of your zones.</p>
+              <p style="font-size:13px;color:rgba(41,17,0,0.75);margin:0 0 6px;max-width:60%">Begin with a walk-through of your zones. Tap to log your check-in.</p>
+              <div id="shift-start-checkin-status" style="font-size:11px;color:rgba(41,17,0,0.55);max-width:60%"></div>
               <img src="{{ url_for('static', filename='img/illustration-zones.png') }}" style="position:absolute;right:10px;bottom:-8px;width:100px;height:auto">
             </div>
             <div style="width:190px;flex:none;background:#fff;border-radius:24px;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:14px 0">
@@ -63,17 +64,18 @@
 
           <h3 class="display-font" style="font-weight:500;font-size:17px;margin:0 0 14px">Quick actions</h3>
           <div style="display:flex;gap:14px;margin-bottom:28px;flex-wrap:wrap">
-            <div style="flex:1;min-width:160px;background:#EAF0DE;border-radius:20px;padding:18px">
+            <div class="hover-lift" role="button" tabindex="0" onclick="Haven.roundCheckin()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();Haven.roundCheckin()}" style="flex:1;min-width:160px;background:#EAF0DE;border-radius:20px;padding:18px;cursor:pointer">
               <div style="font-size:13px;font-weight:600;color:#291100;margin-bottom:6px">Round check-in</div>
               <div style="font-size:12px;color:rgba(41,17,0,0.65);margin-bottom:12px;line-height:1.4">Log that you've walked through your assigned zones.</div>
               <span style="font-size:11px;background:#405221;color:#EAF0DE;padding:4px 10px;border-radius:999px">Routine</span>
+              <div id="qa-checkin-status" style="font-size:11px;color:rgba(41,17,0,0.55);margin-top:8px">No check-in yet this shift</div>
             </div>
-            <div style="flex:1;min-width:160px;background:#F3D9C8;border-radius:20px;padding:18px">
+            <div class="hover-lift" role="button" tabindex="0" onclick="Haven.goPage('incidents')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();Haven.goPage('incidents')}" style="flex:1;min-width:160px;background:#F3D9C8;border-radius:20px;padding:18px;cursor:pointer">
               <div style="font-size:13px;font-weight:600;color:#291100;margin-bottom:6px">Review open incidents</div>
               <div style="font-size:12px;color:rgba(41,17,0,0.65);margin-bottom:12px;line-height:1.4">Incidents not yet marked reviewed from this shift.</div>
               <span id="qa-open-incidents-tag" style="font-size:11px;background:#7A2E12;color:#F3D9C8;padding:4px 10px;border-radius:999px">0 open</span>
             </div>
-            <div style="flex:1;min-width:160px;background:#FBF6DE;border-radius:20px;padding:18px">
+            <div class="hover-lift" role="button" tabindex="0" onclick="Haven.goPage('system')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();Haven.goPage('system')}" style="flex:1;min-width:160px;background:#FBF6DE;border-radius:20px;padding:18px;cursor:pointer">
               <div style="font-size:13px;font-weight:600;color:#291100;margin-bottom:6px">Camera health</div>
               <div style="font-size:12px;color:rgba(41,17,0,0.65);margin-bottom:12px;line-height:1.4">Cameras currently reporting offline.</div>
               <span id="qa-offline-cams-tag" style="font-size:11px;background:#7C6212;color:#FBF6DE;padding:4px 10px;border-radius:999px">0 offline</span>
@@ -344,6 +346,11 @@
           <h4 style="font-size:14px;margin:0 0 12px">Camera health</h4>
           <div id="camera-health-list"></div>
         </div>
+        <div id="checkin-history-card" class="card" style="padding:22px 24px;margin-bottom:20px;display:none">
+          <h4 style="font-size:14px;margin:0 0 4px">Round check-in history</h4>
+          <p style="font-size:12px;color:rgba(43,26,8,0.55);margin:0 0 14px">Most recent check-ins across every caregiver, newest first.</p>
+          <div id="checkin-history-list" style="font-size:13px;color:rgba(43,26,8,0.75)"></div>
+        </div>
         <button id="save-system-btn" class="pill-btn pill-btn-primary" style="padding:12px 24px;font-size:14px" onclick="Haven.saveSystemSettings()">Save changes</button>
         <span id="system-save-toast" style="margin-left:14px;font-size:13px;color:#7A2E12;display:none">Saved. Takes effect on next restart of the detection service.</span>
       </div>
@@ -370,6 +377,7 @@
         </div>
       </div>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input id="cam-active" type="checkbox"> Active</label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input id="cam-hazard" type="checkbox"> Hazard detection (dangerous object near a person)</label>
     </div>
     <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:22px">
       <button class="pill-btn pill-btn-outline" onclick="Haven.closeCameraModal()">Cancel</button>

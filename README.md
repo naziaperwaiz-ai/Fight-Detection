@@ -81,14 +81,13 @@ This system watches the actual behavior: it detects people, classifies whether t
                                           "What's the deployer's responsibility"
 ```
 
+The diagram above is the per-frame pipeline for one camera. Running more than one camera doesn't duplicate it: `MultiCameraEngine` loads each ML model (person detector, violence classifier, hazard pose model) exactly once and, every cycle, batches that one model call across every camera's latest frame instead of looping through cameras one at a time. Only per-camera state -- the state machine, hazard debounce streaks, object tracker, motion baseline -- stays separate. See "Multi-Camera Architecture" below.
+
 ## Screenshots
 
-![Sign in](images/login.png)
-![Dashboard](images/dashboard.png)
-![Incident detail](images/incident-detail.png)
-![Alerts & notifications](images/alerts.png)
-![Analytics](images/analytics.png)
-![System settings (admin view)](images/system-settings-admin.png)
+![Incident detail: Hazard Detected (knife, high severity)](screenshots/incident-detail-hazard.png)
+
+Real screenshots live under `screenshots/` (tracked, unlike `images/` -- see the note in Project Structure), not the placeholder `images/login.png`-style paths this section used to reference. Only one is checked in so far; add more here as they're captured.
 
 ---
 
@@ -99,6 +98,10 @@ This system watches the actual behavior: it detects people, classifies whether t
 **Per-person state, not per-frame score.** Two people standing close together isn't a fight; a sustained high score from one specific tracked person is. Each tracked ID has its own six-state machine (`Normal → Proximate → Agitated → Fighting → On Ground → Emergency`), so a fight between two people doesn't get lost in an averaged frame score, and a person left motionless on the ground for 30 seconds escalates on its own even if the "fight" itself already ended.
 
 **Confirmation gate before alerting, not a single-frame trigger.** A score has to stay above `VIOLENCE_THRESHOLD` for `CONFIRM_SECONDS` of sustained frames before an alert fires, with a per-camera cooldown afterward. This is the same tradeoff any alerting system makes: catch it fast, but don't page someone over one noisy frame.
+
+**A motion/proximity backup signal, because the classifier alone can under-score a real fight.** Agitated → Fighting normally requires the score to clear `VIOLENCE_THRESHOLD` (0.9 by default) -- and getting there at all requires the score to first clear `STATE_AGITATED_SCORE` (0.4), with no lower bar anywhere in that chain. A genuinely violent but blurry or oddly-angled clip (motion blur, a camera angle the RLVS/SCVD/UCF-Crime training data doesn't represent well) can average well under 0.4 and never escalate at all -- no alert, and critically no saved clip, since `_start_recording` is only ever called from inside the alert-trigger blocks. `StateMachine._update_motion_fight_pair` adds a second, score-independent path: if two *proximate* tracked people are **both** moving fast relative to their own bounding-box size (`STATE_MOTION_FIGHT_INTENSITY`, diagonals/sec so it's scale-invariant regardless of distance from the camera), sustained for `STATE_MOTION_FIGHT_CONFIRM_SECONDS`, both escalate straight to Fighting regardless of what the classifier scored them. Requiring *both* tracks to be fast, not just one, is deliberate -- one person walking briskly past someone standing still is common and is not a fight. It mirrors the existing fall-detection rule's shape exactly: geometry-only, no dependency on the classifier, a brief-interruption tolerance (`STATE_MOTION_FIGHT_RECOVER_SECONDS`) so one still frame mid-scuffle doesn't discard progress. A track that escalated this way carries `motion_confirmed_fight = True`, which `pipeline.py` surfaces in the console log and the dispatched alert payload so an operator reading a low-confidence "Fighting Detected" alert can see it was motion-corroborated, not a classifier false read.
+
+**Two guards on the motion signal, added after it produced a real false positive.** In production, a single caregiver just moving around alone -- no second person anywhere in frame -- had the live feed unblur and a clip get recorded. The likely mechanism: `_check_proximity` only checks bbox-center distance, so a person tracker's occasional glitch of briefly reporting one real body as two overlapping track ids (most likely to happen exactly while someone is moving quickly, which is also what this signal is watching for) looked indistinguishable from "two proximate people both moving fast." Two independent guards in `_update_motion_fight_pair` now close that gap: `STATE_MOTION_FIGHT_MAX_IOU` rejects a pair whose latest boxes overlap more than that fraction (a duplicate detection's box sits almost exactly where the original was; two real people essentially never overlap that much even mid-grapple), and `STATE_MOTION_FIGHT_MIN_TRACK_AGE_SECONDS` withholds judgment on any track younger than that (a duplicate-detection artifact is, by definition, a track id that just appeared). Neither guard discards the pair's sustained-motion progress when it trips -- it just withholds that frame's judgment, the same way `_update_fall` withholds judgment on a too-small bbox rather than resetting.
 
 **Fall and hazard detection are independent signals, not new branches of the violence state machine.** A person who trips with no altercation never generates a violence score, so bolting fall detection onto the six-state machine above would mean it only ever fires downstream of violence. Instead, `fall_status` (bbox height collapse + sustained horizontal aspect) and hazard detection (a knife/scissors/fork class from the same YOLO pass, near a wrist via pose estimation) are separate, rule-based signals -- not trained classifiers, since there's no labelled fall or hazard dataset in this project -- that run in parallel and can fire regardless of what the violence state machine is doing. See "Detection Signals" below.
 
@@ -111,6 +114,22 @@ This system watches the actual behavior: it detects people, classifies whether t
 **Row-level scoping by session identity, not by client-supplied ID.** A caregiver's profile is always read and written using the logged-in session's ID (`current_user.id`), never an ID the client sends. The same rule applies anywhere per-caregiver data gets added later.
 
 **Two roles, enforced server-side.** Only administrators can change the detection model or detection defaults (confirm seconds, motion threshold, buffer, cooldown). The dashboard hides those controls from caregiver accounts, but the actual enforcement is a `403` from the Flask route itself: the UI hiding a button is not a security boundary.
+
+**Every alert type gets a clip, not just the ones the state machine happens to confirm first.** Violence and Hazard events started a clip recording from the beginning; Fighting, Fall, and Emergency escalations did not, so an incident that only ever crossed the state-machine's Fighting/Fall/Emergency signals (never the raw score threshold) showed "No clip" in Incident History even though something real had happened. All five alert types now call the same `_start_recording` path, gated only on `alert_active` so an in-progress recording is never interrupted or reset by a second event firing mid-clip.
+
+**A camera that drops one frame should not go dark for the rest of the run.** Each camera's capture thread used to treat a single failed `cap.read()` -- which happens for mundane reasons, like a transient driver hiccup -- as fatal, breaking its read loop permanently with no further output and no way to recover short of restarting the whole process. It now retries with a short backoff, and after enough consecutive failures releases and reopens the underlying capture device, logging each state transition so a real dead camera is still visible in the console, not silently hidden behind an endless retry loop.
+
+**Hazard debouncing tracks "something dangerous is near a wrist," not "this specific label is near a wrist."** The underlying object classifier's label for a knife vs. scissors can flicker frame to frame even when the same physical object is being held in the same place. Debouncing per-label meant that flicker could reset the streak before it ever reached `HAZARD_MIN_CONSECUTIVE`, so a real, sustained hazard could go unreported. The streak is tracked once per camera, keyed to "closest hazard-class candidate to any wrist" regardless of which label won that frame, so classification noise on an otherwise-consistent detection no longer defeats the debounce.
+
+**The reported hazard label is a vote across the debounce window, not whichever sample happened to trigger it.** A caregiver reported an incident logged as "Scissors Detected" for an object that was visibly a knife. Root cause: `_fire_events` used to report the label of whatever single sample crossed `HAZARD_MIN_CONSECUTIVE`, so a real knife correctly read on most of the debounced samples but misread as scissors on the specific sample that happened to hit the threshold got logged and alerted under the wrong label -- a coin flip against debounce window length, unrelated to what the classifier actually saw most. `_fire_events` now tallies which label won each sample across the whole streak and reports the plurality; an exact tie (common at the default `HAZARD_MIN_CONSECUTIVE=2`, where one sample each way has no majority) breaks toward whichever label had the higher total confidence.
+
+**Dashboard "Quick actions" are real actions, not decoration.** The three cards on the dashboard home page used to be static -- nothing happened on click. "Review open incidents" and "Camera health" now navigate to the page that actually shows that information (Incident History and System Settings, respectively). "Round check-in" now logs a real, timestamped check-in for the current caregiver via `/api/checkins/add`, row-scoped by session identity the same way `/api/profile` already was (see "Row-level scoping by session identity" above) -- never a client-supplied caregiver id -- and the card shows that caregiver's own last check-in time, read back via `/api/checkins/last`. An admin-only `/api/checkins` endpoint, surfaced as a "Round check-in history" card in System Settings, lists every caregiver's check-ins newest first -- accountability for whether rounds are actually happening, not just a personal reminder to the caregiver who taps it.
+
+**Check-ins live in `events.db`, not a new JSON file.** `SqliteCheckinsStore` (`dashboard/events_store.py`) adds a `round_checkins` table to the same SQLite file `SqliteEventsStore` already uses, rather than a sixth flat-JSON store next to cameras/profiles/announcements/settings. Check-in write volume doesn't scale with camera count the way incident events' does -- it scales with caregiver headcount and shift cadence, a caregiver tapping one button a few times a shift -- so it didn't independently justify a SQLite migration on the same grounds incident events did (see "Incident history is SQLite, everything else stays flat JSON" below). It moved there anyway because one database file with two tables is less operational sprawl than a database file plus a growing pile of single-purpose JSON files, once a SQLite connection already exists in the process. Unlike `SqliteEventsStore`'s diff-based `mutate`/`mutate_if` (built for incident notes/review/false-positive edits after the fact), `SqliteCheckinsStore` is a plain `add`/`last_for`/`list_all` surface, since a check-in is never edited after it's logged.
+
+**A saved clip's frame rate is measured, not assumed.** The clip writer used to always encode at `config.FPS` -- the camera's *configured* target rate -- regardless of how many frames were actually captured during the real recording window. Under `MultiCameraEngine`'s batched cycle, the real per-camera capture/append rate can fall well short of `config.FPS` under load (more cameras, hazard pose detection enabled, a slow host); writing far fewer frames than `config.FPS` implies, at `config.FPS`, produces a technically valid `.mp4` whose reported duration (`frame_count / fps`) is a small fraction of the real event -- for a short enough frame count, that rounds to "0:00" in most players even though a real multi-second event was captured. Each camera now tracks the real wall-clock time its frames were appended (`buffer_times`, alongside `buffer`), and `_save_clip` derives the writer's fps from the real elapsed span and frame count instead, falling back to `config.FPS` only when that span is missing or too small to trust.
+
+**Incident history is SQLite; cameras/profiles/announcements/settings stay flat JSON.** Those four are low-volume and rarely written, so a single JSON file with a lock is the right amount of infrastructure for them. Incident events are the store written on every alert, per camera, and a single-file-rewrite-per-write design (read the whole file, mutate a Python list, write the whole file back) doesn't hold up as camera count and incident volume grow -- every additional camera means more writers serializing on the same lock, and every mutation still pays the cost of rewriting the entire incident history to change one row. `dashboard/events_store.py`'s `SqliteEventsStore` is a drop-in replacement with the identical `load`/`save`/`mutate`/`mutate_if` interface `JsonStore` already had, so no route in `app.py` needed to change, but a mutation now does a real per-row `INSERT`/`UPDATE`/`DELETE` against an indexed table instead of a full-file rewrite. An existing `events.json` is migrated automatically and exactly once, the first time the app actually touches incident storage after upgrading: every event in it is imported into the new `events.db`, and the original file is renamed to `events.json.migrated` (kept, not deleted) rather than removed, so nothing is destroyed if a migration ever needs to be checked by hand.
 
 ---
 
@@ -127,6 +146,8 @@ Login is rate-limited to 10 attempts per minute per IP via Flask-Limiter, enough
 ### Internal service authentication
 
 `/api/events/add` (the endpoint the detection pipeline posts incidents to) is not behind caregiver login at all, because the pipeline has no browser session to log in with. It's gated by a separate shared secret (`X-Internal-Key` header, checked with `hmac.compare_digest` to avoid timing attacks) and fails closed with a `503` if that key isn't configured, rather than silently accepting unauthenticated writes.
+
+That POST (and the follow-up "clip ready" POST once a recording finishes saving) is made with Python's `requests`, which verifies the server's TLS certificate against the public CA bundle by default. A self-signed cert -- which is what `src/certs/generate_cert.py` produces, see "What's the deployer's responsibility" below -- can never pass that check, so once the dashboard is served over HTTPS with that cert, every internal alert POST failed its SSL handshake silently: the alert printed to the console and the email attempted to send, but the incident never once reached Incident History, with nothing logged to explain why. `main.py` now threads the exact cert path it generated TLS from down into each camera's config as `DASHBOARD_CERT_PATH`, and the pipeline passes that specific cert to `requests`' `verify` argument instead of the public CA bundle -- trusting precisely the cert the dashboard is actually serving, not disabling verification wholesale. A failure here is also now printed instead of swallowed by a bare `except: pass`, so a real problem (wrong cert path, dashboard down, network issue) is visible in the console rather than silently invisible in the UI.
 
 ### CORS
 
@@ -150,7 +171,7 @@ Two independent age windows, configurable from System Settings: `retention_days`
 
 ### Session secret and internal key
 
-`SECRET_KEY` (signs caregiver sessions) and `INTERNAL_API_KEY` (authenticates the detection service) must each be a real random value set in `config.py`, which is gitignored. If neither is set, the app falls back to a random key generated per process start: sessions won't survive a restart, which is the safe failure mode, not a silent security hole.
+`SECRET_KEY` (signs caregiver sessions) and `INTERNAL_API_KEY` (authenticates the detection service) must each be a real random value set via the `HAVEN_SECRET_KEY`/`HAVEN_INTERNAL_API_KEY` environment variables (see step 4 above) -- not hardcoded in `config.py`, gitignored or not. If neither is set, the app falls back to a random key generated per process start: sessions won't survive a restart, which is the safe failure mode, not a silent security hole.
 
 ### What's the deployer's responsibility
 
@@ -174,7 +195,7 @@ Two independent age windows, configurable from System Settings: `retention_days`
 
 **What this explicitly does not protect against**
 
-- *A leaked `INTERNAL_API_KEY`*: anyone holding it can write fabricated incidents. There's no key rotation built in; rotating means editing `config.py` and restarting both the dashboard and every camera worker.
+- *A leaked `INTERNAL_API_KEY`*: anyone holding it can write fabricated incidents. There's no key rotation built in; rotating means setting a new `HAVEN_INTERNAL_API_KEY` value and restarting both the dashboard and every camera worker.
 - *Network-level access to the server*: this app assumes it's deployed on a network the facility already controls. It can optionally terminate TLS itself with a self-signed cert (`src/certs/`), enough to satisfy browser secure-context checks on that local network, but it provides no VPN, network segmentation, or publicly-trusted certificate -- see "What's the deployer's responsibility" above.
 - *A compromised admin account*: an admin who gets phished can change detection thresholds or swap the model. There's no second admin approval step, including for issuing new invites.
 - *Distributed rate-limit bypass*: the in-memory limiter is per-process; running multiple app instances behind a load balancer without a shared Redis backend would let an attacker get more attempts by hitting different instances.
@@ -202,7 +223,7 @@ Two independent age windows, configurable from System Settings: `retention_days`
 | Rate limiting | Flask-Limiter |
 | Frontend | Vanilla JS + Jinja2 templates (no framework) |
 | Fonts | Bitter (display), Figtree (body), via Google Fonts |
-| Storage | Flat JSON files under `outputs/logs/` |
+| Storage | SQLite (`outputs/logs/events.db`: incident events + round check-ins, two tables); flat JSON for everything else (cameras, profiles, settings, announcements) under `outputs/logs/` |
 | Testing | pytest |
 
 ---
@@ -217,7 +238,7 @@ cd Fight-Detection
 
 ### 2. Install dependencies
 ```bash
-pip install torch torchvision ultralytics opencv-python flask flask-login flask-limiter scikit-learn pandas requests
+pip install torch torchvision ultralytics opencv-python flask flask-login flask-limiter flask-wtf scikit-learn pandas requests
 ```
 
 ### 3. Download the model
@@ -230,18 +251,16 @@ Download `finetuned_model.pt` from Google Drive and place it in `models/`:
 cp src/detection/config.example.py src/detection/config.py
 ```
 
-Edit `src/detection/config.py`:
-```python
-MODEL_PATH         = "models/finetuned_model.pt"
-CAMERA_SOURCE      = 0                    # 0 = webcam, or RTSP URL
-EMAIL_SENDER       = "your@gmail.com"
-EMAIL_APP_PASSWORD = "your-app-password"
-EMAIL_RECIPIENTS   = ["staff@hospital.com"]
-SECRET_KEY         = "<run: python -c \"import secrets; print(secrets.token_hex(32))\">"
-INTERNAL_API_KEY   = "<run the same command again for a second, different key>"
+`config.py`'s non-secret defaults (`MODEL_PATH`, `CAMERA_SOURCE`, etc.) can be edited directly in the file. Secrets are read from environment variables instead of being written into the file at all, so set these before running the app:
+```bash
+export HAVEN_EMAIL_SENDER="your@gmail.com"
+export HAVEN_EMAIL_APP_PASSWORD="your-app-password"
+export HAVEN_EMAIL_RECIPIENTS="staff@hospital.com,other-staff@hospital.com"
+export HAVEN_SECRET_KEY=$(python -c "import secrets; print(secrets.token_hex(32))")
+export HAVEN_INTERNAL_API_KEY=$(python -c "import secrets; print(secrets.token_hex(32))")
 ```
 
-`SECRET_KEY` and `INTERNAL_API_KEY` must each be your own randomly generated value. Never reuse the example placeholders, and never commit `config.py` (it's already gitignored).
+`HAVEN_SECRET_KEY` and `HAVEN_INTERNAL_API_KEY` must each be your own randomly generated value, and never the same as each other. If either is left unset, the app still runs -- it generates a random value for that process only and prints a warning -- but sessions and the internal API key then reset on every restart, so set both explicitly for anything meant to stay up. Never commit `config.py` (it's already gitignored) or put real secret values in it; the whole point of reading them from the environment is that they never need to live in a file on disk next to the code.
 
 ### 5. Create your first account
 There is no open sign-up page you can use before any account exists, so the very first account has to come from the command line. Make it an `admin`, since only admins can invite anyone else afterward.
@@ -280,9 +299,21 @@ pip install pytest
 PYTHONPATH=src pytest tests/ -v
 ```
 
-`tests/test_dashboard.py` (42 tests) covers the Flask app end to end: login happy path and failure paths (wrong password, nonexistent email, both giving the same generic error), the login rate limit actually triggering a `429` after repeated attempts, the open-redirect guard on the post-login `next` parameter, session teardown on logout, the CORS-wildcard-stripping hook, admin-only enforcement on system settings and model upload (caregiver gets `403`, admin gets `200`), camera CRUD, internal-key enforcement on incident ingestion, incident notes/review/false-positive toggles, per-caregiver profile scoping (one caregiver's saved profile isn't visible as another's), alert settings persistence (including the sound/desktop notification toggles), and analytics reflecting logged incidents. It also covers the invite flow specifically: a caregiver can't create invites (`403`), an admin-issued invite grants access to `/signup`, submitting it creates the account and logs the new user in, the same link is rejected as invalid on a second use, mismatched passwords are rejected without consuming the token, an invite can't target an email that already has an account, admins can revoke a pending invite, and repeated sign-up submissions trip the rate limiter. Room-scoped access gets its own block: an unassigned caregiver sees zero rooms, a scoped caregiver sees only their room across cameras/incidents/analytics/clips, cross-room video-feed/score/clip access is denied (including the deleted-camera edge case where a still-registered worker must not become reachable again), and only an admin can change a caregiver's room assignment. Retention gets its own block too: cleanup is admin-only, correctly deletes old and false-positive incidents on their respective windows, and the admin status endpoint reflects the last run. Each test runs against a throwaway JSON store, not real deployment data.
+162 tests across 7 files, all passing:
 
-`tests/test_state_machine.py` (4 tests) unit-tests the fall-detection rule in `detection/state_machine.py` directly, with a monkeypatched clock instead of real sleeps: a sustained fall confirms, a single occluded/too-small sample mid-window doesn't discard progress toward confirmation, genuinely standing back up still resets to `None`, and a `Confirmed` track correctly recovers to `None` after sustained recovery time -- this is the only layer of the codebase that exercises the state machine directly rather than through the Flask HTTP layer, which is what let two real bugs there go uncaught until manual review.
+`tests/test_dashboard.py` (63 tests) covers the Flask app end to end: login happy path and failure paths (wrong password, nonexistent email, both giving the same generic error), the login rate limit actually triggering a `429` after repeated attempts, the open-redirect guard on the post-login `next` parameter, session teardown on logout, the CORS-wildcard-stripping hook, admin-only enforcement on system settings and model upload (caregiver gets `403`, admin gets `200`), camera CRUD, internal-key enforcement on incident ingestion, incident notes/review/false-positive toggles, per-caregiver profile scoping (one caregiver's saved profile isn't visible as another's), round check-in logging and its same per-caregiver scoping, plus the admin-only check-in history endpoint (see "Quick actions are real actions" above), alert settings persistence (including the sound/desktop notification toggles), and analytics reflecting logged incidents. It also covers the invite flow specifically: a caregiver can't create invites (`403`), an admin-issued invite grants access to `/signup`, submitting it creates the account and logs the new user in, the same link is rejected as invalid on a second use, mismatched passwords are rejected without consuming the token, an invite can't target an email that already has an account, admins can revoke a pending invite, and repeated sign-up submissions trip the rate limiter. Room-scoped access gets its own block: an unassigned caregiver sees zero rooms, a scoped caregiver sees only their room across cameras/incidents/analytics/clips, cross-room video-feed/score/clip access is denied (including the deleted-camera edge case where a still-registered worker must not become reachable again), and only an admin can change a caregiver's room assignment. Retention gets its own block too: cleanup is admin-only, correctly deletes old and false-positive incidents on their respective windows, and the admin status endpoint reflects the last run. Each test runs against a throwaway store (SQLite events db plus the flat JSON stores), not real deployment data.
+
+`tests/test_pipeline.py` (34 tests) covers `detection/pipeline.py`'s `process_frame()` alert-escalation and recording wiring: that Fighting/Fall/Emergency alerts dispatch (previously `has_fighting()` had zero callers anywhere in the codebase) and share one cooldown budget per camera rather than each getting its own; the live-feed privacy blur (frozen, pixelated placeholder except while something is actually happening -- Agitated and up, a confirmed fall, or a hazard event this frame -- with a hysteresis window before it re-blurs); hazard bounding-box visualization on the live feed; and clip recording for every alert type (Violence, Hazard, Fighting, Fall, Emergency all start a recording, an already-in-progress recording is never interrupted by a second event, and a clip is actually written to disk once `POST_EVENT_SECONDS` elapses). It also regression-tests `_dispatch_alert`'s and `_save_clip`'s SSL cert verification and error logging (see "Internal service authentication" above), and `_save_clip`'s writer fps (derived from the real achieved capture rate, floored at a valid positive value, falling back to `config.FPS` only when the real elapsed span is missing or too small to trust -- see "A saved clip's frame rate is measured, not assumed" above).
+
+`tests/test_multi_camera.py` (22 tests) covers the batched multi-camera engine (`detection/multi_camera.py`) and what it depends on: `SimpleIOUTracker` (id persistence across frames, new ids for new boxes, aging out stale tracks, and that two cameras' trackers never see each other's ids) and `hazard._fire_events`'s debounce/streak firing, including that label flicker between samples (e.g. knife vs. scissors on the same physical object) doesn't defeat the streak, and that the reported label is the majority across the debounce window -- not just whichever sample happened to trigger it -- with ties breaking toward higher total confidence. It also covers `_CaptureThread`'s resilience to a single dropped frame (retries, doesn't break the read loop) and to sustained failure (reopens the underlying capture device after enough consecutive failures).
+
+`tests/test_notifier.py` (10 tests) covers `notification/notifier.py`'s live-settings wiring (a caregiver's saved Alert Settings -- recipients, `email_channel` -- actually changes what a real alert does, not just what the test-alert endpoint uses) and the blank-credential handling: `send_alert` skips gracefully with a clear message when `EMAIL_SENDER`/`EMAIL_APP_PASSWORD` are blank instead of falling through to a raw SMTP auth error, and a genuine Gmail credential rejection (`535`) prints a specific pointer toward the two most common causes (not a Google App Password, or 2-Step Verification not enabled).
+
+`tests/test_state_machine.py` (17 tests) unit-tests the per-person state machine and the fall-detection rule in `detection/state_machine.py` directly, with a monkeypatched clock instead of real sleeps: a sustained fall confirms, a single occluded/too-small sample mid-window doesn't discard progress toward confirmation, genuinely standing back up still resets to `None`, and a `Confirmed` track correctly recovers to `None` after sustained recovery time -- this is the only layer of the codebase that exercises the state machine directly rather than through the Flask HTTP layer. It also covers the motion/proximity backup signal (see "A motion/proximity backup signal" above): mutual fast motion between two proximate tracks escalates to Fighting even when the score never clears `STATE_AGITATED_SCORE`, a single fast mover next to someone stationary does not escalate, a brief stall doesn't discard sustained-motion progress while a stall past `STATE_MOTION_FIGHT_RECOVER_SECONDS` does reset it, `motion_confirmed_fight` is set on escalation and cleared once the track recovers back down the ladder, and -- the regression test for a real reported false positive -- two heavily-overlapping boxes (a simulated duplicate-detection glitch) never escalate no matter how long the shared motion continues, and a freshly-spawned second track can't co-trigger the signal before `STATE_MOTION_FIGHT_MIN_TRACK_AGE_SECONDS` has passed.
+
+`tests/test_main.py` (13 tests) covers `src/main.py`'s `_build_camera_config`, the function that turns one `cameras.json` record into a per-camera `Config` used by `MultiCameraEngine` -- including that `DASHBOARD_CERT_PATH` is threaded through when TLS is configured and absent otherwise.
+
+`tests/test_detector.py` (3 tests) regression-tests a rate-limited diagnostic in `PersonDetector.detect()` for a frame where the tracker returns no `ids` array (a real, expected occurrence, not a bug) -- it used to silently drop every person-class box with zero visibility into why.
 
 ---
 
@@ -301,7 +332,7 @@ Normal ──► Proximate ──► Agitated ──► Fighting ──► On Gr
 | Normal | Default | Green |
 | Proximate | Two people close together | Yellow |
 | Agitated | Rapid movement, score > 0.4 | Orange |
-| Fighting | Score > 0.9 sustained 3s | Red |
+| Fighting | Score > 0.9 sustained, **or** two proximate people both moving fast (bbox-diagonals/sec) sustained `STATE_MOTION_FIGHT_CONFIRM_SECONDS` -- see "A motion/proximity backup signal" above | Red |
 | On Ground | Bounding box wider than tall | Purple |
 | Emergency | On ground > 30 seconds | Alert |
 
@@ -355,10 +386,22 @@ Hazard detection is opt-in and disabled by default (`HAZARD_DETECTION_ENABLED = 
 | `HAZARD_PROXIMITY_FRAC` | `0.06` | Object-to-wrist distance threshold, as a fraction of frame size |
 | `HAZARD_MIN_CONSECUTIVE` | `2` | Consecutive sampled detections required before a hazard fires |
 | `HAZARD_MIN_SEVERITY` | `high` | Minimum severity class (see `hazard_class_map`) to act on |
+| `HAZARD_BOX_DISPLAY_SECONDS` | `5` | How long a bounding box stays drawn on the live feed around a flagged hazard object |
+| `DASHBOARD_CERT_PATH` | (none) | Not user-configured -- `main.py` sets this automatically from whatever TLS cert it generated, so internal alert/incident POSTs verify against that exact cert instead of the public CA bundle. See "Internal service authentication" above |
 
 System Settings (dashboard, not `config.py`) also exposes `retention_days` (default `90`) and `false_positive_retention_days` (default `7`) -- see "Data retention" in the Security section.
 
-Admins can also change `CONFIRM_SECONDS`, `MOTION_THRESHOLD`, `BUFFER_SECONDS`, and `POST_EVENT_SECONDS` from the System Settings page in the dashboard; caregivers see these as read-only.
+Admins can also change `CONFIRM_SECONDS`, `MOTION_THRESHOLD`, `BUFFER_SECONDS`, and `POST_EVENT_SECONDS` from the System Settings page in the dashboard; caregivers see these as read-only. `main.py` reads these into each camera's `Config` at engine startup, so a saved change takes effect the next time the detection service (re)starts, not on already-running cameras -- restart to pick up a new value.
+
+---
+
+## Multi-Camera Architecture
+
+`MultiCameraEngine` (`detection/multi_camera.py`) is what actually runs in production, not one `CameraWorker` per camera in isolation. It loads each ML model exactly once -- one shared person detector, one shared violence classifier, one shared hazard pose model -- and, once per cycle, batches that one model call across every camera's latest frame instead of looping through cameras and calling each model once per camera. A GPU (or CPU) processing N frames in one batched call is faster per-frame than N sequential single-frame calls, since the model's fixed overhead is paid once, not N times. Each camera still has its own lightweight capture thread that only does frame I/O -- reading off the video source -- so a slow or stalled camera doesn't stall the batch; per-camera state (state machine, hazard debounce streak, object tracker, motion baseline) also stays fully separate, only the model calls themselves are shared.
+
+**Cycle timing.** The engine's cycle interval is `1 / max(FPS across all configured cameras)`, so the whole batched cycle targets running once per frame-period of the fastest camera. Adding cameras increases the amount of work done inside each cycle (more frames to detect, track, and pose-estimate) without increasing the time budget per cycle -- so the practical failure mode as camera count grows isn't a crash, it's cycles quietly falling behind and both detection and the live feed lagging real time. `_run_cycle` now logs a diagnostic (rate-limited to once per 5s, only when a cycle runs at least 3x its target) breaking the cycle down by step -- frame gather, detection, tracking/motion, classification, hazard pose, dispatch -- specifically so "the cycle is slow" becomes "the pose model took 12s of a 14s cycle" instead of a guess. A slow cycle isn't just a live-feed lag issue: it also means `process_frame()` runs far less often than `config.FPS` implies, which starves a saved clip's frame count relative to its recording window's real wall-clock length (see "A saved clip's frame rate is measured, not assumed" above) -- so on a heavily CPU-bound deployment, a clip can legitimately end up being very short even with that fix in place, because there genuinely weren't many frames captured during the window. Watch for this log line if clips seem shorter than `POST_EVENT_SECONDS` should produce.
+
+**Device placement.** The violence classifier already picks CUDA when available (`torch.device("cuda" if torch.cuda.is_available() else "cpu")`) and falls back to CPU otherwise. The person detector and hazard pose model are currently hardcoded to `device="cpu"` regardless of what hardware is present, even though both are Ultralytics YOLO models whose `.track()`/`.predict()` calls already accept a `device` argument -- the plumbing to run them on GPU exists, it's just not wired up yet. At low camera counts this doesn't matter; as camera count grows, the CPU-bound batched detection and pose passes are the more likely first bottleneck, not the classifier, since they scale with camera count while the CPU's compute budget doesn't. Moving them onto the same device as the classifier is mechanical (pass the same device value through instead of the `"cpu"` literal) but should be validated under real camera count and real hardware afterward, since it introduces GPU memory contention between three models that didn't exist when only the classifier ran there.
 
 ---
 
@@ -372,7 +415,8 @@ Fight-Detection/
 │   │   ├── users.py                  # Account store (hashed passwords, roles)
 │   │   └── create_caregiver.py       # CLI, provisions the first admin account
 │   ├── detection/
-│   │   ├── pipeline.py               # Core inference pipeline
+│   │   ├── pipeline.py               # Core inference pipeline (CameraWorker), alerting, clip recording
+│   │   ├── multi_camera.py           # MultiCameraEngine: one shared model set, batched per cycle across cameras
 │   │   ├── detector.py               # YOLO person detector + tracker (+ hazard's object pass)
 │   │   ├── state_machine.py          # Per-person 6-state machine, plus independent fall_status
 │   │   ├── hazard.py                 # Hazard detection: object-near-wrist rule (pose model)
@@ -380,6 +424,7 @@ Fight-Detection/
 │   │   └── config.py                 # Your config (not in repo)
 │   ├── dashboard/
 │   │   ├── app.py                    # Flask app: auth, room scoping, rate limiting, all API routes
+│   │   ├── events_store.py           # SqliteEventsStore (incident events) + SqliteCheckinsStore (round check-ins), same events.db
 │   │   ├── retention.py              # Age-based cleanup of old incidents/clips
 │   │   ├── static/                   # CSS, JS, images
 │   │   └── templates/                # login.html, index.html, signup.html
@@ -390,14 +435,19 @@ Fight-Detection/
 │       └── README.md                 # When (not) to use a self-signed cert
 ├── tests/
 │   ├── test_dashboard.py             # pytest suite for the Flask app
-│   └── test_state_machine.py         # Direct unit tests for the fall-detection rule
+│   ├── test_pipeline.py              # Alert escalation, clip recording, live-feed blur
+│   ├── test_multi_camera.py          # Batched engine, SimpleIOUTracker, hazard debounce, capture resilience
+│   ├── test_notifier.py              # Live alert settings, blank-credential and Gmail-auth handling
+│   ├── test_main.py                  # cameras.json -> per-camera Config mapping
+│   ├── test_detector.py              # PersonDetector diagnostic logging
+│   └── test_state_machine.py         # Direct unit tests for the per-person state machine + fall rule
 ├── outputs/
 │   ├── clips/                        # Recorded alert clips
-│   ├── logs/                         # events.json, cameras.json, users.json, invites.json, etc.
+│   ├── logs/                         # events.db (SQLite), cameras.json, users.json, invites.json, etc.
 │   └── manifests/                    # Dataset CSVs
 ├── models/                           # Model weights (see Drive link)
-├── PRIVACY_POLICY.md                 # Template, adapt before publishing
-├── TERMS_OF_USE.md                   # Template, adapt before publishing
+├── screenshots/                      # Real product screenshots for the README (tracked, unlike images/ below)
+├── images/                           # Design-reference clippings, not product screenshots -- gitignored
 └── README.md
 ```
 
@@ -424,6 +474,7 @@ Three channels, each independently toggleable from Alerts & Notifications. **Ema
 - [ ] Blur video outside confirmed alerts (silhouette/blurred feed during normal operation, full video only once an alert fires)
 - [ ] `INTERNAL_API_KEY` rotation with an overlap window, so camera workers don't all need restarting in the same instant
 - [ ] A real stop/join mechanism for `CameraWorker` threads -- deleting a camera today unregisters it from the dashboard's routes immediately, but the underlying capture thread has no way to be told to stop
+- [ ] Move the person detector and hazard pose model onto GPU (currently hardcoded to CPU; only the violence classifier already picks CUDA when available) -- see "Multi-Camera Architecture" above for why this is the more likely bottleneck as camera count grows
 
 ---
 

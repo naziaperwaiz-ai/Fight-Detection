@@ -4,15 +4,17 @@
 # paths), role-based access control, CORS-wildcard stripping, rate
 # limiting, and the core CRUD/incident endpoints. Run with:
 #
-#   pip install pytest flask flask-login flask-limiter opencv-python-headless
+#   pip install pytest flask flask-login flask-limiter flask-wtf opencv-python-headless
 #   PYTHONPATH=src pytest tests/ -v
 #
 # This suite uses a throwaway outputs/ directory (via the CWD fixture
 # below) so running it never touches real camera/incident/user data.
 
 import importlib
+import io
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -26,12 +28,12 @@ sys.path.insert(0, str(SRC))
 def app_client(tmp_path, monkeypatch):
     """Fresh Flask app + fresh JSON stores + two seeded accounts per test.
 
-    auth/users.py and dashboard/app.py compute their JSON store paths from
-    `Path(__file__).parent...` at import time, not from the working
-    directory -- so `monkeypatch.chdir()` alone would NOT isolate test runs
-    from each other or from real deployment data. Instead we import the
-    modules once, then explicitly clear each store file they point at
-    before every test.
+    auth/users.py and dashboard/app.py compute their JSON store paths
+    from `Path(__file__).parent...` at import time, not from the
+    working directory, so `monkeypatch.chdir()` alone does not isolate
+    test runs from each other or from real deployment data. Instead the
+    modules are imported once, then each store file they point at is
+    explicitly cleared before every test.
     """
     # A minimal Config so app.py's `from detection.config import Config`
     # succeeds without requiring a real deployment config.py.
@@ -65,19 +67,41 @@ def app_client(tmp_path, monkeypatch):
         "ANNOUNCE_FILE", "SETTINGS_FILE", "SYS_SETTINGS_FILE",
     ):
         getattr(app_module, path_attr).unlink(missing_ok=True)
+    # Events AND round check-ins now live in the same SQLite db
+    # (dashboard.events_store's SqliteEventsStore / SqliteCheckinsStore
+    # -- two tables, one file) instead of events.json directly. Clear
+    # the db file itself plus any sidecar WAL/SHM journal files sqlite
+    # may have left behind, and the renamed legacy-migration marker
+    # (LOGS_FILE.unlink() above only removes events.json itself, not
+    # events.json.migrated) -- otherwise a prior test's data, or its
+    # already-migrated marker, would leak into this one. One unlink
+    # clears both tables since they share the file.
+    events_db = app_module.EVENTS_DB_FILE
+    events_db.unlink(missing_ok=True)
+    Path(str(events_db) + "-wal").unlink(missing_ok=True)
+    Path(str(events_db) + "-shm").unlink(missing_ok=True)
+    Path(str(app_module.LOGS_FILE) + ".migrated").unlink(missing_ok=True)
 
-    # jane is scoped to Sunroom Wing on purpose -- most of this suite's
+    # jane is scoped to Sunroom Wing on purpose. Most of this suite's
     # cameras/incidents live in that room, and an unscoped caregiver (the
-    # actual account default) would correctly see none of them. Tests that
-    # specifically exercise room scoping create their own additional,
-    # deliberately-unassigned or differently-assigned accounts below.
+    # actual account default) would correctly see none of them. Tests
+    # that specifically exercise room scoping create their own
+    # additional, deliberately unassigned or differently assigned
+    # accounts below.
     users_module.create_caregiver(
         "jane@ward.org", "correcthorse123", "Jane Doe", role="caregiver",
         assigned_rooms=["Sunroom Wing"],
     )
     users_module.create_caregiver("lead@ward.org", "correcthorse123", "Lead Sup", role="admin")
 
-    app_module.app.config.update(TESTING=True)
+    # WTF_CSRF_ENABLED=False: this suite exercises route behavior (auth,
+    # authorization, CRUD, room scoping), not CSRF token handling itself,
+    # and Flask-WTF's CSRFProtect (see dashboard/app.py) does not
+    # automatically relax under TESTING=True the way some other
+    # frameworks' test modes do. CSRF enforcement itself is covered
+    # separately in test_csrf_protection_is_enforced below, against a
+    # client that deliberately leaves this flag at its real default.
+    app_module.app.config.update(TESTING=True, WTF_CSRF_ENABLED=False)
     yield app_module
 
 
@@ -158,6 +182,95 @@ def test_wildcard_cors_header_is_stripped(app_client):
     assert r.headers.get("Access-Control-Allow-Origin") is None
 
 
+def test_security_headers_are_set(app_client):
+    r = app_client.app.test_client().get("/login")
+    assert r.headers.get("X-Frame-Options") == "DENY"
+    assert r.headers.get("X-Content-Type-Options") == "nosniff"
+    csp = r.headers.get("Content-Security-Policy", "")
+    assert "script-src 'self'" in csp
+    assert "frame-ancestors 'none'" in csp
+
+
+def test_session_cookie_is_secure_and_httponly(app_client):
+    c = app_client.app.test_client()
+    r = c.post("/login", data={"email": "lead@ward.org", "password": "correcthorse123"})
+    set_cookie = r.headers.get("Set-Cookie", "")
+    assert "session=" in set_cookie
+    assert "HttpOnly" in set_cookie
+    assert "Secure" in set_cookie
+    assert "SameSite=Lax" in set_cookie
+
+
+# ---------------------------------------------------------------------------
+# CSRF protection
+# ---------------------------------------------------------------------------
+def test_csrf_protection_is_enforced(app_client):
+    # The app_client fixture disables WTF_CSRF_ENABLED for the rest of
+    # this suite (it exercises route behavior -- auth, authorization,
+    # CRUD -- not CSRF token handling itself). This test explicitly
+    # re-enables the real default to prove CSRFProtect actually rejects a
+    # mutating request with no token, and accepts one carrying the real
+    # token the same way dashboard.js's fetch() wrapper sends it.
+    admin = login(app_client, "lead@ward.org")   # while CSRF is still disabled, matching every other login() call
+    app_client.app.config["WTF_CSRF_ENABLED"] = True
+
+    r = admin.post("/api/cameras/add", json={"id": "CAM-CSRF", "room": "Sunroom Wing", "source": "0"})
+    assert r.status_code == 400
+    assert not any(c["id"] == "CAM-CSRF" for c in admin.get("/api/cameras").json)
+
+    token = re.search(r'data-csrf-token="([^"]+)"', admin.get("/").data.decode()).group(1)
+    r2 = admin.post(
+        "/api/cameras/add",
+        json={"id": "CAM-CSRF", "room": "Sunroom Wing", "source": "0"},
+        headers={"X-CSRFToken": token},
+    )
+    assert r2.status_code == 200
+    assert any(c["id"] == "CAM-CSRF" for c in admin.get("/api/cameras").json)
+
+
+# ---------------------------------------------------------------------------
+# Model upload path traversal
+# ---------------------------------------------------------------------------
+def test_upload_model_sanitizes_traversal_filename_and_stays_confined(app_client, tmp_path, monkeypatch):
+    # MODELS_DIR is computed once from the real repo root in app.py, not
+    # a per-test tmp dir like the JSON stores the fixture already
+    # isolates above -- so this test explicitly redirects it rather than
+    # risking a write into (or escaping from) the real project's models/.
+    isolated_models_dir = tmp_path / "models"
+    isolated_models_dir.mkdir()
+    monkeypatch.setattr(app_client, "MODELS_DIR", isolated_models_dir)
+
+    admin = login(app_client, "lead@ward.org")
+    data = {"model": (io.BytesIO(b"not a real checkpoint"), "../../escaped.pt")}
+    r = admin.post("/api/system-settings/upload-model", data=data, content_type="multipart/form-data")
+    assert r.status_code == 200
+
+    written = list(isolated_models_dir.rglob("*.pt"))
+    assert len(written) == 1
+    assert written[0].parent == isolated_models_dir   # confined despite the ../../ in the original filename
+    assert not (tmp_path / "escaped.pt").exists()      # nothing landed outside models/
+
+
+def test_upload_model_resolved_path_guard_blocks_even_if_the_sanitizer_is_bypassed(app_client, tmp_path, monkeypatch):
+    # Regression guard for the second, independent containment check in
+    # upload_model(): simulates a hypothetical future regression where
+    # secure_filename() itself fails to strip a traversal sequence, and
+    # confirms the resolved-path comparison still refuses to write
+    # outside MODELS_DIR rather than trusting the sanitizer alone.
+    isolated_models_dir = tmp_path / "models"
+    isolated_models_dir.mkdir()
+    monkeypatch.setattr(app_client, "MODELS_DIR", isolated_models_dir)
+    monkeypatch.setattr(app_client, "secure_filename", lambda name: name)   # pass-through, simulating a bypass
+
+    outside_target = tmp_path / "evil.pt"
+    admin = login(app_client, "lead@ward.org")
+    data = {"model": (io.BytesIO(b"malicious"), "../evil.pt")}
+    r = admin.post("/api/system-settings/upload-model", data=data, content_type="multipart/form-data")
+    assert r.status_code == 400
+    assert not outside_target.exists()
+    assert list(isolated_models_dir.iterdir()) == []
+
+
 # ---------------------------------------------------------------------------
 # Role-based access control (system settings / model upload)
 # ---------------------------------------------------------------------------
@@ -181,9 +294,9 @@ def test_admin_can_write_system_settings(app_client):
 # Cameras / incidents / profile / settings
 # ---------------------------------------------------------------------------
 def test_camera_crud_round_trip(app_client):
-    # Camera CRUD (add/update/delete) is admin-only -- see app.py's comment
+    # Camera CRUD (add/update/delete) is admin-only; see app.py's comment
     # on the cameras section. jane (a plain caregiver) is used below only
-    # to confirm she can still READ the resulting list.
+    # to confirm she can still read the resulting list.
     admin = login(app_client, "lead@ward.org")
     cg = login(app_client, "jane@ward.org")
 
@@ -195,10 +308,83 @@ def test_camera_crud_round_trip(app_client):
 
     cams = cg.get("/api/cameras").json
     assert cams[0]["patients"] == 3 and cams[0]["priority"] == "High"
+    # hazard_enabled defaults to False when not given, matching the
+    # opt-in design in detection/hazard.py: hazard detection should
+    # never turn on silently for a camera nobody explicitly enabled it
+    # for.
+    assert cams[0]["hazard_enabled"] is False
 
     assert admin.post("/api/cameras/update/CAM-01", json={"room": "Renamed"}).status_code == 200
+    assert admin.post("/api/cameras/update/CAM-01", json={"hazard_enabled": True}).status_code == 200
+    assert admin.get("/api/cameras").json[0]["hazard_enabled"] is True
+
     assert admin.delete("/api/cameras/delete/CAM-01").status_code == 200
     assert admin.get("/api/cameras").json == []
+
+
+def test_add_camera_hazard_enabled_true_persists(app_client):
+    admin = login(app_client, "lead@ward.org")
+    assert admin.post("/api/cameras/add", json={
+        "id": "CAM-HAZ", "room": "Sunroom Wing", "source": "0", "hazard_enabled": True,
+    }).status_code == 200
+    cams = admin.get("/api/cameras").json
+    assert next(c for c in cams if c["id"] == "CAM-HAZ")["hazard_enabled"] is True
+
+
+def test_add_camera_falls_back_to_the_global_alert_threshold(app_client):
+    # No threshold sent, and no Alert Settings saved yet either (defaults
+    # to 90%), so the new camera should end up at 0.9, not the old
+    # hardcoded 0.7 that had no relationship to any admin-visible
+    # setting.
+    admin = login(app_client, "lead@ward.org")
+    assert admin.post("/api/cameras/add", json={
+        "id": "CAM-DEFAULT", "room": "Sunroom Wing", "source": "0",
+    }).status_code == 200
+    cams = admin.get("/api/cameras").json
+    assert next(c for c in cams if c["id"] == "CAM-DEFAULT")["threshold"] == 0.9
+
+
+def test_add_camera_threshold_default_follows_saved_alert_settings(app_client):
+    admin = login(app_client, "lead@ward.org")
+    assert admin.post("/api/settings", json={"threshold": 70}).status_code == 200
+
+    assert admin.post("/api/cameras/add", json={
+        "id": "CAM-FOLLOWS", "room": "Sunroom Wing", "source": "0",
+    }).status_code == 200
+    cams = admin.get("/api/cameras").json
+    assert next(c for c in cams if c["id"] == "CAM-FOLLOWS")["threshold"] == 0.7
+
+    # An explicit threshold in the request must still win over the
+    # global default.
+    assert admin.post("/api/cameras/add", json={
+        "id": "CAM-EXPLICIT", "room": "Sunroom Wing", "source": "0", "threshold": 0.55,
+    }).status_code == 200
+    cams = admin.get("/api/cameras").json
+    assert next(c for c in cams if c["id"] == "CAM-EXPLICIT")["threshold"] == 0.55
+
+
+def test_add_camera_honors_explicit_active_false(app_client):
+    # Previously "active" was hardcoded True on add regardless of what a
+    # client sent, so a caregiver unchecking "Active" in the add-camera
+    # modal before saving had no effect until a later edit. The camera
+    # dict must reflect what was actually submitted.
+    admin = login(app_client, "lead@ward.org")
+    assert admin.post("/api/cameras/add", json={
+        "id": "CAM-INACTIVE", "room": "Sunroom Wing", "source": "0", "active": False,
+    }).status_code == 200
+    cams = admin.get("/api/cameras").json
+    cam = next(c for c in cams if c["id"] == "CAM-INACTIVE")
+    assert cam["active"] is False
+    assert cam["liveStatus"] == "Offline"
+
+
+def test_add_camera_still_defaults_active_true_when_omitted(app_client):
+    admin = login(app_client, "lead@ward.org")
+    assert admin.post("/api/cameras/add", json={
+        "id": "CAM-DEFAULT-ACTIVE", "room": "Sunroom Wing", "source": "0",
+    }).status_code == 200
+    cams = admin.get("/api/cameras").json
+    assert next(c for c in cams if c["id"] == "CAM-DEFAULT-ACTIVE")["active"] is True
 
 
 def test_internal_event_ingestion_requires_key(app_client):
@@ -239,6 +425,82 @@ def test_profile_is_scoped_to_current_user(app_client):
     cg.post("/api/profile", json={"about": "6 years in elder care", "notes": "Prefers night shift"})
     assert cg.get("/api/profile").json["about"] == "6 years in elder care"
     assert admin.get("/api/profile").json.get("about", "") != "6 years in elder care"
+
+
+def test_checkin_requires_login(app_client):
+    anon = app_client.app.test_client()
+    assert anon.post("/api/checkins/add").status_code in (302, 401)
+    assert anon.get("/api/checkins/last").status_code in (302, 401)
+
+
+def test_checkin_last_is_none_before_any_checkin(app_client):
+    cg = login(app_client, "jane@ward.org")
+    assert cg.get("/api/checkins/last").json is None
+
+
+def test_checkin_add_logs_and_returns_a_record(app_client):
+    cg = login(app_client, "jane@ward.org")
+    r = cg.post("/api/checkins/add")
+    assert r.status_code == 200
+    record = r.json
+    assert record["caregiver_name"] == "Jane Doe"
+    assert record["rooms"] == ["Sunroom Wing"]
+    assert record["timestamp"]
+
+    last = cg.get("/api/checkins/last").json
+    assert last["id"] == record["id"]
+
+
+def test_checkin_admin_rooms_recorded_as_all(app_client):
+    admin = login(app_client, "lead@ward.org")
+    record = admin.post("/api/checkins/add").json
+    assert record["rooms"] == "all"
+
+
+def test_checkin_is_scoped_to_current_user(app_client):
+    # Row-level scoping by session identity, same property as
+    # /api/profile above: one caregiver's check-in must never appear as
+    # another caregiver's "last check-in".
+    cg = login(app_client, "jane@ward.org")
+    admin = login(app_client, "lead@ward.org")
+
+    cg.post("/api/checkins/add")
+    assert admin.get("/api/checkins/last").json is None
+
+    admin.post("/api/checkins/add")
+    cg_last = cg.get("/api/checkins/last").json
+    assert cg_last["caregiver_name"] == "Jane Doe"
+
+
+def test_checkin_last_reflects_the_most_recent_of_several(app_client):
+    cg = login(app_client, "jane@ward.org")
+    first = cg.post("/api/checkins/add").json
+    second = cg.post("/api/checkins/add").json
+    assert first["id"] != second["id"]
+    assert cg.get("/api/checkins/last").json["id"] == second["id"]
+
+
+def test_checkin_history_is_admin_only(app_client):
+    cg = login(app_client, "jane@ward.org")
+    admin = login(app_client, "lead@ward.org")
+    cg.post("/api/checkins/add")
+
+    assert cg.get("/api/checkins").status_code == 403
+    assert admin.get("/api/checkins").status_code == 200
+
+
+def test_checkin_history_includes_every_caregiver_newest_first(app_client):
+    cg = login(app_client, "jane@ward.org")
+    admin = login(app_client, "lead@ward.org")
+
+    first = cg.post("/api/checkins/add").json
+    second = admin.post("/api/checkins/add").json
+
+    history = admin.get("/api/checkins").json
+    ids = [c["id"] for c in history]
+    assert first["id"] in ids and second["id"] in ids
+    # Newest first: second (admin's) was logged after first (jane's).
+    assert ids.index(second["id"]) < ids.index(first["id"])
 
 
 def test_alert_settings_round_trip(app_client):
@@ -286,8 +548,8 @@ def test_analytics_reflects_logged_incidents(app_client):
 # Invite-based sign-up (no open self-registration)
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# Room-scoped access -- a caregiver should only see cameras/incidents/clips
-# for rooms they're explicitly assigned to; admins see everything.
+# Room-scoped access: a caregiver should only see cameras/incidents/clips
+# for rooms they are explicitly assigned to; admins see everything.
 # ---------------------------------------------------------------------------
 def _seed_two_room_setup(app_client):
     """Two cameras/incidents in different rooms, plus an admin session to
@@ -308,7 +570,7 @@ def _seed_two_room_setup(app_client):
 
 
 def test_unassigned_caregiver_sees_no_rooms(app_client):
-    # A caregiver created with no assigned_rooms (the actual default) --
+    # A caregiver created with no assigned_rooms (the actual default),
     # not jane, who this fixture deliberately scopes to Sunroom Wing.
     import auth.users as users_module
     users_module.create_caregiver("new_hire@ward.org", "correcthorse123", "New Hire", role="caregiver")
@@ -342,7 +604,7 @@ def test_caregiver_cannot_reach_incident_in_other_room(app_client):
         if e["room"] == "Memory Care Unit"
     )
     r = cg.get(f"/api/incidents/{other_room_incident['id']}")
-    assert r.status_code == 404  # not 403 -- must not confirm the incident exists
+    assert r.status_code == 404  # not 403; must not confirm the incident exists
     assert cg.post(f"/api/incidents/{other_room_incident['id']}/notes", json={"notes": "x"}).status_code == 404
 
 
@@ -356,18 +618,19 @@ def test_caregiver_cannot_reach_video_feed_or_score_in_other_room(app_client):
 
 
 def test_deleted_camera_video_feed_and_score_deny_not_allow(app_client):
-    """Regression test for a bug found in the final code sweep: _camera_room()
-    returns None for a camera id that isn't in cameras.json (e.g. deleted
-    while its worker thread was still registered), and video_feed/get_score
-    used to treat "room is None" as "no room check applies" -- the opposite
-    of what _clip_room_accessible does for the same ambiguous case. That
-    let a caregiver reach a deleted camera's still-running feed/score even
-    though they could never have accessed it by camera id while it existed
-    unassigned to their rooms. Deleting must narrow access, never widen it."""
+    """Regression test for a bug found in the final code sweep. _camera_room()
+    returns None for a camera id that is not in cameras.json (for example,
+    deleted while its worker thread was still registered), and video_feed/
+    get_score used to treat "room is None" as "no room check applies", the
+    opposite of what _clip_room_accessible does for the same ambiguous
+    case. That let a caregiver reach a deleted camera's still-running
+    feed/score even though they could never have accessed it by camera id
+    while it existed unassigned to their rooms. Deleting must narrow
+    access, never widen it."""
     _seed_two_room_setup(app_client)
     admin = login(app_client, "lead@ward.org")
     # A worker some request handler still has a reference to, as if the
-    # camera thread never actually stopped -- see delete_camera's comment.
+    # camera thread never actually stopped; see delete_camera's comment.
     app_client.register_worker("CAM-02", object())
     admin.delete("/api/cameras/delete/CAM-02")
 
@@ -421,6 +684,29 @@ def test_clip_room_scoping(app_client, monkeypatch, tmp_path):
         "alert_CAM-02_20260101_120000.mp4",
         "alert_CAM-99_20260101_120000.mp4",
     }, "an admin sees every clip regardless of room, including unmatched ones"
+
+
+def test_clip_route_always_declares_video_mp4(app_client, monkeypatch, tmp_path):
+    """Regression test for a real deployment bug: serve_clip used to let
+    Werkzeug guess the Content-Type from the filename extension via
+    Python's stdlib mimetypes module. On Windows that guess consults the
+    Windows registry's file-extension associations rather than a bundled
+    table, and a missing/broken .mp4 registry entry there makes it fall
+    through to application/octet-stream -- a fully valid, correctly
+    encoded H.264 clip that a browser's <video> element then refuses to
+    even attempt playing, since it was never told the response is a
+    video. serve_clip now passes mimetype="video/mp4" explicitly so the
+    header can never depend on the host OS's mimetype database."""
+    _seed_two_room_setup(app_client)
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    monkeypatch.setattr(app_client, "CLIPS_DIR", clips_dir)
+    (clips_dir / "alert_CAM-01_20260101_120000.mp4").write_bytes(b"fake")
+
+    cg = login(app_client, "jane@ward.org")
+    resp = cg.get("/clips/alert_CAM-01_20260101_120000.mp4")
+    assert resp.status_code == 200
+    assert resp.headers["Content-Type"] == "video/mp4"
 
 
 def test_admin_sees_every_room_regardless_of_assigned_rooms(app_client):
@@ -610,3 +896,93 @@ def test_signup_is_rate_limited(app_client):
         "token": token, "password": "wrongwrong", "confirm_password": "different",
     }).status_code for _ in range(15)]
     assert 429 in codes
+
+
+# ---------------------------------------------------------------------------
+# JsonStore: locking closes the read-modify-write race that plain
+# load()/save() functions had, and _write_json_atomic prevents a
+# concurrent reader from ever observing a torn (partially-written) file.
+# These regression tests exercise the store directly with real threads,
+# since the race they guard against only shows up under genuine
+# concurrency, not a single-threaded call sequence.
+# ---------------------------------------------------------------------------
+import threading
+
+
+def test_json_store_mutate_has_no_lost_updates_under_concurrency(app_client):
+    """Regression test for the sequential-fix work order's Logic Errors
+    item 4 (JSON-store races). Before JsonStore.mutate() existed,
+    add_camera's load-then-append-then-save had no lock across the gap:
+    many threads racing add_camera concurrently could each read the same
+    "N existing cameras" snapshot and each save N+1, with all but the
+    last save's single new camera silently lost. mutate() holds the lock
+    for the whole cycle, so N concurrent appends must always produce
+    N cameras in the file, not fewer."""
+    store = app_client._cameras_store
+    store.save([])
+
+    N = 25
+    def _add(i):
+        def _mutate(cameras):
+            cameras.append({"id": f"CAM-{i}"})
+        store.mutate(_mutate)
+
+    threads = [threading.Thread(target=_add, args=(i,)) for i in range(N)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    saved = store.load()
+    assert len(saved) == N, (
+        f"expected {N} cameras from {N} concurrent mutate() calls, got "
+        f"{len(saved)} -- some updates were lost to a race"
+    )
+    assert {c["id"] for c in saved} == {f"CAM-{i}" for i in range(N)}
+
+
+def test_add_camera_route_generates_unique_ids_under_concurrency(app_client):
+    """Same race as above, exercised through the real /api/cameras/add
+    route and its default-id-from-count logic, using a fresh test_client
+    per thread (Flask's test client is not documented thread-safe to
+    share across threads)."""
+    admin_email = "lead@ward.org"
+
+    def _add():
+        c = login(app_client, admin_email)
+        c.post("/api/cameras/add", json={"room": "Concurrency Room", "source": "0"})
+
+    N = 10
+    threads = [threading.Thread(target=_add) for _ in range(N)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    cameras = app_client.load_cameras()
+    room_cameras = [c for c in cameras if c["room"] == "Concurrency Room"]
+    assert len(room_cameras) == N, (
+        f"expected {N} cameras added concurrently, found {len(room_cameras)} "
+        "-- some add_camera calls silently overwrote each other"
+    )
+    ids = [c["id"] for c in room_cameras]
+    assert len(set(ids)) == len(ids), f"duplicate camera ids assigned under concurrency: {ids}"
+
+
+def test_write_json_atomic_leaves_old_content_readable_mid_write(app_client, tmp_path):
+    """_write_json_atomic writes to a temp file and os.replace()s it into
+    place, rather than truncating the real file in place. This checks
+    the target file's content is always one of the two complete JSON
+    payloads, never a truncated/partial one, by writing a large payload
+    and confirming the temp file cleans up and the destination parses
+    correctly afterward (a torn write would leave invalid JSON or a
+    stray .tmp file behind)."""
+    path = tmp_path / "atomic_test.json"
+    path.write_text(json.dumps({"version": 1}))
+
+    big_payload = {"version": 2, "data": list(range(50000))}
+    app_client._write_json_atomic(path, big_payload)
+
+    assert json.loads(path.read_text()) == big_payload
+    leftover_tmp_files = list(tmp_path.glob(".atomic_test.json.tmp-*"))
+    assert leftover_tmp_files == [], f"temp file(s) left behind: {leftover_tmp_files}"
