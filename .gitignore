@@ -19,12 +19,27 @@ datasets/
 # Outputs
 outputs/frames/
 outputs/clips/
+# outputs/logs/ is every runtime data store the app writes: events.db
+# (SQLite -- incident events + round check-ins), users.json (caregiver
+# accounts, including password_hash), cameras.json, profiles.json,
+# invites.json, settings.json, announcements.json. All of it is
+# per-deployment data, not source -- never meant to be committed.
 outputs/logs/
+
+# Any SQLite database file, wherever it ends up. outputs/logs/ above
+# already covers events.db at its current path; this is a defense-in-
+# depth backstop so a future path/rename doesn't silently start
+# tracking a real database.
+*.db
+*.sqlite
+*.sqlite3
 
 # Environment
 .env
+.env.*
 venv/
 env/
+.venv/
 
 # VS Code
 .vscode/
@@ -40,6 +55,9 @@ runs/
 # pytest
 .pytest_cache/
 
+# Real per-deployment config: SECRET_KEY/INTERNAL_API_KEY generation
+# fallback, email credentials, camera source. See config.example.py for
+# the tracked template.
 src/detection/config.py
 
 # images
