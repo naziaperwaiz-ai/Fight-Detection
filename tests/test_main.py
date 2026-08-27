@@ -136,6 +136,49 @@ def test_build_camera_config_falls_back_to_config_defaults_when_setting_missing(
     assert cfg.POST_EVENT_SECONDS == Config.POST_EVENT_SECONDS
 
 
+def test_build_camera_config_picks_up_hazard_supervision_settings(monkeypatch):
+    # Same regression as test_build_camera_config_picks_up_system_settings
+    # above, for the two hazard supervision-context settings added this
+    # week (previously config.py-only, no System Settings control at
+    # all -- see dashboard/app.py's _system_settings_with_defaults).
+    monkeypatch.setattr(main, "load_system_settings", lambda: {
+        "hazard_require_unsupervised": False,
+        "hazard_quiet_hours_start": 22,
+        "hazard_quiet_hours_end": 6,
+    })
+    cfg = _build_camera_config({"id": "CAM-01", "room": "A", "source": "0"})
+    assert cfg.HAZARD_REQUIRE_UNSUPERVISED is False
+    assert cfg.HAZARD_QUIET_HOURS_START == 22
+    assert cfg.HAZARD_QUIET_HOURS_END == 6
+
+
+def test_build_camera_config_hazard_quiet_hours_null_means_off(monkeypatch):
+    # Quiet hours' "off" state is an explicit None, not an absent key --
+    # this must survive the round trip through sys_settings.get(), not
+    # get coerced to some other falsy value or silently fall back to a
+    # stale Config-class default of a *different* value.
+    monkeypatch.setattr(main, "load_system_settings", lambda: {
+        "hazard_require_unsupervised": True,
+        "hazard_quiet_hours_start": None,
+        "hazard_quiet_hours_end": None,
+    })
+    cfg = _build_camera_config({"id": "CAM-01", "room": "A", "source": "0"})
+    assert cfg.HAZARD_QUIET_HOURS_START is None
+    assert cfg.HAZARD_QUIET_HOURS_END is None
+
+
+def test_build_camera_config_falls_back_to_hazard_defaults_when_setting_missing():
+    # No System Settings override saved yet (a fresh install, or one
+    # from before this feature existed) -- must not crash, and must fall
+    # back to whatever config.py itself specifies, same fallback pattern
+    # as confirm_seconds/motion_threshold above.
+    from detection.config import Config
+    cfg = _build_camera_config({"id": "CAM-01", "room": "A", "source": "0"})
+    assert cfg.HAZARD_REQUIRE_UNSUPERVISED == getattr(Config, "HAZARD_REQUIRE_UNSUPERVISED", True)
+    assert cfg.HAZARD_QUIET_HOURS_START == getattr(Config, "HAZARD_QUIET_HOURS_START", None)
+    assert cfg.HAZARD_QUIET_HOURS_END == getattr(Config, "HAZARD_QUIET_HOURS_END", None)
+
+
 def test_build_camera_config_hazard_enabled_is_per_camera():
     # The whole point of wiring this through: two cameras built from two
     # different records must not share a HAZARD_DETECTION_ENABLED value.

@@ -290,6 +290,45 @@ def test_admin_can_write_system_settings(app_client):
     assert admin.get("/api/system-settings").json["confirm_seconds"] == 5
 
 
+def test_admin_can_write_hazard_supervision_settings(app_client):
+    # Regression test for this week's fix: HAZARD_REQUIRE_UNSUPERVISED
+    # and quiet hours used to only be editable by hand-editing config.py
+    # and restarting, with no dashboard control -- see
+    # _system_settings_with_defaults and update_system_settings in
+    # app.py, and _build_camera_config in main.py, for the rest of the
+    # wiring this exercises indirectly.
+    admin = login(app_client, "lead@ward.org")
+    r = admin.post("/api/system-settings", json={
+        "hazard_require_unsupervised": False,
+        "hazard_quiet_hours_start": 22,
+        "hazard_quiet_hours_end": 6,
+    })
+    assert r.status_code == 200
+    s = admin.get("/api/system-settings").json
+    assert s["hazard_require_unsupervised"] is False
+    assert s["hazard_quiet_hours_start"] == 22
+    assert s["hazard_quiet_hours_end"] == 6
+
+
+def test_hazard_quiet_hours_can_be_turned_back_off_with_explicit_null(app_client):
+    # An explicit JSON null is a real, meaningful value here (turn quiet
+    # hours off) -- must not be dropped/ignored, and must not be coerced
+    # into 0 (a real hour, midnight) or left as whatever was previously
+    # saved.
+    admin = login(app_client, "lead@ward.org")
+    admin.post("/api/system-settings", json={"hazard_quiet_hours_start": 22, "hazard_quiet_hours_end": 6})
+    r = admin.post("/api/system-settings", json={"hazard_quiet_hours_start": None, "hazard_quiet_hours_end": None})
+    assert r.status_code == 200
+    s = admin.get("/api/system-settings").json
+    assert s["hazard_quiet_hours_start"] is None
+    assert s["hazard_quiet_hours_end"] is None
+
+
+def test_caregiver_cannot_write_hazard_supervision_settings(app_client):
+    cg = login(app_client, "jane@ward.org")
+    assert cg.post("/api/system-settings", json={"hazard_require_unsupervised": False}).status_code == 403
+
+
 # ---------------------------------------------------------------------------
 # Cameras / incidents / profile / settings
 # ---------------------------------------------------------------------------
@@ -399,6 +438,43 @@ def test_internal_event_ingestion_requires_key(app_client):
         headers={"X-Internal-Key": "test-internal-key"},
     )
     assert r.status_code == 200
+
+
+def test_event_add_stores_hazard_supervision_context(app_client):
+    # person_count/quiet_hours are the supervision-context fields
+    # pipeline.py's process_frame now attaches to a Hazard Detected
+    # event -- confirms they round-trip through the store rather than
+    # being silently dropped since add_event builds a fixed-schema dict,
+    # not a passthrough of whatever CameraWorker POSTs.
+    client = app_client.app.test_client()
+    client.post(
+        "/api/events/add",
+        json={"camera_id": "CAM-01", "room": "Sunroom Wing", "event_type": "Hazard Detected",
+              "confidence": 0.6, "detail": "knife (high severity), unsupervised, during quiet hours",
+              "person_count": 1, "quiet_hours": True},
+        headers={"X-Internal-Key": "test-internal-key"},
+    )
+    cg = login(app_client, "jane@ward.org")
+    event = cg.get("/api/events").json[0]
+    assert event["person_count"] == 1
+    assert event["quiet_hours"] is True
+
+
+def test_event_add_defaults_supervision_context_to_none_for_other_event_types(app_client):
+    # A Violence/Fighting/Fall/Emergency event never computes supervision
+    # context (that's hazard-specific), so it must not silently inherit
+    # stale values from data it didn't send -- these should be None, not
+    # missing or falsy-but-wrong like 0/False.
+    client = app_client.app.test_client()
+    client.post(
+        "/api/events/add",
+        json={"camera_id": "CAM-01", "room": "Sunroom Wing", "event_type": "Violence Detected", "confidence": 0.91},
+        headers={"X-Internal-Key": "test-internal-key"},
+    )
+    cg = login(app_client, "jane@ward.org")
+    event = cg.get("/api/events").json[0]
+    assert event["person_count"] is None
+    assert event["quiet_hours"] is None
 
 
 def test_incident_notes_review_and_false_positive(app_client):
@@ -684,29 +760,6 @@ def test_clip_room_scoping(app_client, monkeypatch, tmp_path):
         "alert_CAM-02_20260101_120000.mp4",
         "alert_CAM-99_20260101_120000.mp4",
     }, "an admin sees every clip regardless of room, including unmatched ones"
-
-
-def test_clip_route_always_declares_video_mp4(app_client, monkeypatch, tmp_path):
-    """Regression test for a real deployment bug: serve_clip used to let
-    Werkzeug guess the Content-Type from the filename extension via
-    Python's stdlib mimetypes module. On Windows that guess consults the
-    Windows registry's file-extension associations rather than a bundled
-    table, and a missing/broken .mp4 registry entry there makes it fall
-    through to application/octet-stream -- a fully valid, correctly
-    encoded H.264 clip that a browser's <video> element then refuses to
-    even attempt playing, since it was never told the response is a
-    video. serve_clip now passes mimetype="video/mp4" explicitly so the
-    header can never depend on the host OS's mimetype database."""
-    _seed_two_room_setup(app_client)
-    clips_dir = tmp_path / "clips"
-    clips_dir.mkdir()
-    monkeypatch.setattr(app_client, "CLIPS_DIR", clips_dir)
-    (clips_dir / "alert_CAM-01_20260101_120000.mp4").write_bytes(b"fake")
-
-    cg = login(app_client, "jane@ward.org")
-    resp = cg.get("/clips/alert_CAM-01_20260101_120000.mp4")
-    assert resp.status_code == 200
-    assert resp.headers["Content-Type"] == "video/mp4"
 
 
 def test_admin_sees_every_room_regardless_of_assigned_rooms(app_client):

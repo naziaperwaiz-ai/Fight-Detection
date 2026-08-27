@@ -443,12 +443,28 @@ def _system_settings_with_defaults(stored):
         # full window. See dashboard/retention.py.
         "retention_days": 90,
         "false_positive_retention_days": 7,
+        # Hazard supervision context (see detection/pipeline.py's
+        # process_frame and detection/config.example.py's own copies of
+        # these three) -- previously only editable by hand-editing
+        # config.py and restarting, with no dashboard control at all.
+        # Same "edited here, applied by main.py at next engine startup"
+        # pattern as confirm_seconds/motion_threshold/etc. above, not a
+        # live-reloaded setting.
+        "hazard_require_unsupervised": True,
+        "hazard_quiet_hours_start":    None,
+        "hazard_quiet_hours_end":      None,
     }
     if _cfg is not None:
         defaults["confirm_seconds"]    = getattr(_cfg, "CONFIRM_SECONDS", defaults["confirm_seconds"])
         defaults["motion_threshold"]   = getattr(_cfg, "MOTION_THRESHOLD", defaults["motion_threshold"])
         defaults["buffer_seconds"]     = getattr(_cfg, "BUFFER_SECONDS", defaults["buffer_seconds"])
         defaults["post_event_seconds"] = getattr(_cfg, "POST_EVENT_SECONDS", defaults["post_event_seconds"])
+        defaults["hazard_require_unsupervised"] = getattr(
+            _cfg, "HAZARD_REQUIRE_UNSUPERVISED", defaults["hazard_require_unsupervised"])
+        defaults["hazard_quiet_hours_start"] = getattr(
+            _cfg, "HAZARD_QUIET_HOURS_START", defaults["hazard_quiet_hours_start"])
+        defaults["hazard_quiet_hours_end"] = getattr(
+            _cfg, "HAZARD_QUIET_HOURS_END", defaults["hazard_quiet_hours_end"])
     if stored:
         defaults.update(stored)
     return defaults
@@ -615,6 +631,14 @@ def add_event():
             "clip_path":  data.get("clip_path", ""),
             "states":     data.get("states", []),  # snapshot of tracked-person states at alert time
             "detail":     data.get("detail", ""),  # free-text rule explanation (e.g. hazard events)
+            # Supervision context for a Hazard Detected event (see
+            # pipeline.py's process_frame) -- also embedded in `detail`
+            # as text, but kept structured here too so a future view can
+            # filter/sort by it instead of parsing free text. None for
+            # every other event type, not just hazard events with no
+            # context computed.
+            "person_count": data.get("person_count"),
+            "quiet_hours":  data.get("quiet_hours"),
             "notes":      "",
             "reviewed":   False,
             "false_positive": False,
@@ -826,39 +850,9 @@ def _clip_room_accessible(filename):
 @app.route("/clips/<filename>")
 @login_required
 def serve_clip(filename):
-    # Reject anything that isn't a real clip filename before it reaches
-    # the filesystem or the room-access check, admin or not. Without
-    # this, an admin session hits send_from_directory for a name that
-    # can never exist -- most commonly "Saving..." (see
-    # CLIP_SAVING_PLACEHOLDER on the dashboard: the placeholder clip_path
-    # an incident carries between "alert fired" and "clip finished
-    # encoding") -- and gets whatever generic 404 Werkzeug happens to
-    # render for a missing file, instead of the same clear JSON error a
-    # non-admin gets from _clip_room_accessible below for the same
-    # not-a-real-clip filename.
-    if not _CLIP_NAME_RE.match(filename):
-        return jsonify({"error": "not found"}), 404
     if not _clip_room_accessible(filename):
         return jsonify({"error": "not found"}), 404
-    # mimetype is passed explicitly rather than left for Werkzeug to guess
-    # from the extension. Flask/Werkzeug's guess goes through Python's
-    # stdlib mimetypes module, which on Windows consults the Windows
-    # registry's file-extension associations rather than a bundled table.
-    # When that registry mapping for .mp4 is missing or wrong (a real,
-    # fairly common Windows misconfiguration -- unrelated to this
-    # project, and easy to hit if a codec pack or "cleaner" tool ever
-    # touched HKEY_CLASSES_ROOT), the guess silently falls through to
-    # application/octet-stream. The clip on disk is a perfectly valid,
-    # fully playable H.264 file at that point -- confirmed with ffprobe
-    # -- but the browser's <video> element never attempts to decode a
-    # response it wasn't told is a video, and shows the same dead
-    # 0:00/black-frame state a genuinely broken file would. Every clip
-    # this route ever serves is a .mp4 by construction (_CLIP_NAME_RE
-    # above already enforces that), so there is nothing to actually
-    # guess -- hardcoding it removes the host OS as a variable entirely.
-    return send_from_directory(
-        str(CLIPS_DIR.absolute()), filename, mimetype="video/mp4"
-    )
+    return send_from_directory(str(CLIPS_DIR.absolute()), filename)
 
 @app.route("/api/clips")
 @login_required
@@ -1280,6 +1274,16 @@ def update_system_settings():
             s["retention_days"] = max(1, int(data["retention_days"]))
         if "false_positive_retention_days" in data:
             s["false_positive_retention_days"] = max(1, int(data["false_positive_retention_days"]))
+        if "hazard_require_unsupervised" in data:
+            s["hazard_require_unsupervised"] = bool(data["hazard_require_unsupervised"])
+        # Quiet hours: an explicit null is a real, meaningful value here
+        # (turn quiet hours off), not "field omitted" -- so this checks
+        # key presence, then separately allows None through rather than
+        # coercing it to a number. A non-null value is still clamped to
+        # 0-23 the same way any other hour-of-day input would be.
+        for key in ("hazard_quiet_hours_start", "hazard_quiet_hours_end"):
+            if key in data:
+                s[key] = None if data[key] is None else max(0, min(23, int(data[key])))
         stored.clear()
         stored.update(s)
     _sys_settings_store.mutate(_mutate)

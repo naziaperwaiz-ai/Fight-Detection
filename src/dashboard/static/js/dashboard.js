@@ -631,7 +631,7 @@ const Haven = {
             <span style="font-size:15px;font-weight:600">${esc(inc.camera_id)}</span>
             <span style="font-size:13px;color:rgba(43,26,8,0.6)">${esc(inc.room)}</span>
           </div>
-          <div style="font-size:12px;color:rgba(43,26,8,0.5)">${esc(inc.timestamp)} &middot; ${hasReadyClip(inc.clip_path) ? 'Clip available' : (inc.clip_path ? 'Clip saving&hellip;' : 'No clip')}${inc.reviewed ? ' &middot; Reviewed' : ''}</div>
+          <div style="font-size:12px;color:rgba(43,26,8,0.5)">${esc(inc.timestamp)} &middot; ${inc.clip_path ? 'Clip available' : 'No clip'}${inc.reviewed ? ' &middot; Reviewed' : ''}</div>
         </div>
         <span style="font-size:12px;background:${style.bg};color:${style.fg};padding:6px 14px;border-radius:999px;flex:none">${esc(inc.event_type)}</span>
         <span class="display-font" style="font-size:16px;color:#A3811A;flex:none;width:56px;text-align:right">${pct}%</span>
@@ -671,11 +671,8 @@ const Haven = {
       <div style="display:grid;grid-template-columns:1.3fr 1fr;gap:24px">
         <div>
           <div class="clip-placeholder" style="margin-bottom:20px">
-            ${hasReadyClip(inc.clip_path)
-                ? `<a href="/clips/${encodeURIComponent(inc.clip_path.split('/').pop())}" target="_blank" style="font-size:13px;color:#A3811A">&#9654; Open clip</a>`
-                : inc.clip_path
-                    ? `<span style="font-family:monospace;font-size:12px;color:rgba(43,26,8,0.5)">Clip is still being saved &mdash; check back in a few seconds, or look for the matching "Clip Ready" entry in Incident history.</span>`
-                    : `<span style="font-family:monospace;font-size:12px;color:rgba(43,26,8,0.5)">No clip recorded for this incident</span>`}
+            ${inc.clip_path ? `<a href="/clips/${esc(inc.clip_path.split('/').pop())}" target="_blank" style="font-size:13px;color:#A3811A">&#9654; Open clip</a>`
+                             : `<span style="font-family:monospace;font-size:12px;color:rgba(43,26,8,0.5)">No clip recorded for this incident</span>`}
           </div>
           <h4 style="font-size:14px;margin:0 0 14px">People tracked at alert time</h4>
           <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:24px">
@@ -891,12 +888,19 @@ const Haven = {
     document.getElementById('sys-post-event').value = s.post_event_seconds;
     document.getElementById('sys-retention-days').value = s.retention_days;
     document.getElementById('sys-fp-retention-days').value = s.false_positive_retention_days;
+    document.getElementById('sys-hazard-require-unsupervised').checked = !!s.hazard_require_unsupervised;
+    // null (quiet hours off) renders as an empty field, not "null" or 0 --
+    // 0 is a real hour (midnight) and must stay distinguishable from off.
+    document.getElementById('sys-hazard-quiet-start').value = s.hazard_quiet_hours_start ?? '';
+    document.getElementById('sys-hazard-quiet-end').value = s.hazard_quiet_hours_end ?? '';
 
     const isAdmin = this.state.isAdmin;
-    ['sys-confirm-seconds', 'sys-motion-threshold', 'sys-buffer', 'sys-post-event', 'sys-retention-days', 'sys-fp-retention-days'].forEach(id => {
+    ['sys-confirm-seconds', 'sys-motion-threshold', 'sys-buffer', 'sys-post-event', 'sys-retention-days', 'sys-fp-retention-days',
+     'sys-hazard-require-unsupervised', 'sys-hazard-quiet-start', 'sys-hazard-quiet-end'].forEach(id => {
       document.getElementById(id).disabled = !isAdmin;
     });
     document.getElementById('detection-defaults-note').style.display = isAdmin ? 'none' : 'block';
+    document.getElementById('hazard-supervision-note').style.display = isAdmin ? 'none' : 'block';
     document.getElementById('upload-model-btn').style.display = isAdmin ? 'inline-block' : 'none';
     document.getElementById('upload-model-note').style.display = isAdmin ? 'none' : 'block';
     document.getElementById('save-system-btn').style.display = isAdmin ? 'inline-block' : 'none';
@@ -1032,6 +1036,15 @@ const Haven = {
     const res = await fetch(`/api/invites/by-email/${encodeURIComponent(email)}`, { method: 'DELETE' });
     if (res.ok) this.loadInvites();
   },
+  // '' (empty field) -> null (quiet hours off); a real digit -> that
+  // hour as an int. Used by saveSystemSettings for both quiet-hours
+  // inputs so an intentionally-cleared field sends an explicit "turn
+  // this off" null rather than being silently dropped or coerced to 0.
+  _parseHourOrNull(raw) {
+    if (raw === '' || raw === null || raw === undefined) return null;
+    const n = parseInt(raw, 10);
+    return Number.isNaN(n) ? null : n;
+  },
   async saveSystemSettings() {
     if (!this.state.isAdmin) return;
     const payload = {
@@ -1041,6 +1054,13 @@ const Haven = {
       post_event_seconds: parseInt(document.getElementById('sys-post-event').value, 10),
       retention_days: parseInt(document.getElementById('sys-retention-days').value, 10),
       false_positive_retention_days: parseInt(document.getElementById('sys-fp-retention-days').value, 10),
+      hazard_require_unsupervised: document.getElementById('sys-hazard-require-unsupervised').checked,
+      // Blank field -> null (quiet hours off), not NaN/0 -- an empty
+      // number input's .value is '', and parseInt('') is NaN, which
+      // JSON.stringify would drop the key for entirely rather than
+      // sending an explicit "turn this off" signal the server can act on.
+      hazard_quiet_hours_start: this._parseHourOrNull(document.getElementById('sys-hazard-quiet-start').value),
+      hazard_quiet_hours_end: this._parseHourOrNull(document.getElementById('sys-hazard-quiet-end').value),
     };
     const res = await fetch('/api/system-settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     if (!res.ok) { alert('Could not save (administrator access required).'); return; }
@@ -1084,22 +1104,6 @@ const Haven = {
     input.click();
   },
 };
-
-// CameraWorker posts an incident the instant an alert fires, with
-// clip_path set to this literal placeholder -- the clip itself hasn't
-// finished recording/encoding yet. A second, separate "Clip Ready"
-// incident is posted later (see pipeline.py's _save_clip) once the real
-// file exists, with the real filename as clip_path. Until that second
-// incident shows up, this incident's clip_path is still "Saving..." --
-// not a real filename -- so treating it as one and linking to
-// /clips/Saving... 404s (the "Bad URL" a caregiver sees clicking an
-// alert before its matching Clip Ready entry appears). Every render
-// that turns clip_path into a link or an "available" status must check
-// this first.
-const CLIP_SAVING_PLACEHOLDER = "Saving...";
-function hasReadyClip(clipPath) {
-  return !!clipPath && clipPath !== CLIP_SAVING_PLACEHOLDER;
-}
 
 function esc(str) {
   // Escapes for both HTML text-node content AND HTML attribute-value

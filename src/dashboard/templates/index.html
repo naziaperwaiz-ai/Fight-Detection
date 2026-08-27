@@ -306,6 +306,18 @@
           </div>
           <div id="detection-defaults-note" class="disabled-note" style="margin-top:12px;display:none">Read-only for caregivers. Ask an administrator to change these.</div>
         </div>
+        <div class="card" style="padding:22px 24px;margin-bottom:20px">
+          <h4 style="font-size:14px;margin:0 0 4px">Hazard supervision</h4>
+          <p style="font-size:12px;color:rgba(43,26,8,0.55);margin:0 0 14px">A hazard object near a wrist while someone else is also in frame reads as normal supervised activity, not something to page a caregiver over. Quiet hours mark an unsupervised hazard event as elevated-urgency in its detail -- they never stop an event from firing, only how urgently it's flagged.</p>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;margin-bottom:16px">
+            <input id="sys-hazard-require-unsupervised" type="checkbox"> Only alert on hazard objects when the patient is unsupervised (no one else in frame)
+          </label>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+            <div><label style="display:block;font-size:12px;color:rgba(43,26,8,0.6);margin-bottom:5px">Quiet hours start (0&ndash;23, blank = off)</label><input id="sys-hazard-quiet-start" type="number" min="0" max="23" placeholder="Off" class="pill-input" style="width:100%;border-radius:12px"></div>
+            <div><label style="display:block;font-size:12px;color:rgba(43,26,8,0.6);margin-bottom:5px">Quiet hours end (0&ndash;23, blank = off)</label><input id="sys-hazard-quiet-end" type="number" min="0" max="23" placeholder="Off" class="pill-input" style="width:100%;border-radius:12px"></div>
+          </div>
+          <div id="hazard-supervision-note" class="disabled-note" style="margin-top:12px;display:none">Read-only for caregivers. Ask an administrator to change these.</div>
+        </div>
         <div id="retention-card" class="card" style="padding:22px 24px;margin-bottom:20px;display:none">
           <h4 style="font-size:14px;margin:0 0 4px">Data retention</h4>
           <p style="font-size:12px;color:rgba(43,26,8,0.55);margin:0 0 14px">Incident records and clip files older than "Keep incidents/clips for" are deleted automatically once a day. Incidents marked false positive have their <em>record</em> removed sooner, per the second setting -- but the video clip itself still follows the general window on the left, not the shorter one: clip files aren't reliably linked back to a specific incident in this codebase, so this can't safely delete "just that clip" sooner. If getting confirmed-noise video off disk faster matters more than keeping incident history, lower the setting on the left instead.</p>

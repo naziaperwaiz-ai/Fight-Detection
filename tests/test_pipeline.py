@@ -434,7 +434,7 @@ def test_hazard_event_eventually_saves_a_clip(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline_mod, "threading", SimpleNamespace(Thread=_ImmediateThread))
     worker.cfg.POST_EVENT_SECONDS = 1
     saved = []
-    monkeypatch.setattr(worker, "_save_clip", lambda frames, elapsed_seconds=None: saved.append(frames))
+    monkeypatch.setattr(worker, "_save_clip", lambda frames, elapsed_seconds=None, confidence=None: saved.append(frames))
 
     worker.process_frame(_varied_frame(), detections=[], motion_ok=False, hazard_events=[_hazard_event()])
     assert worker.recording is True
@@ -446,6 +446,148 @@ def test_hazard_event_eventually_saves_a_clip(tmp_path, monkeypatch):
     assert worker.alert_active is False
     assert len(saved) == 1
     assert len(saved[0]) >= 1   # a real, non-empty frame list was handed off
+
+
+def test_hazard_clip_reports_the_triggering_detection_confidence(tmp_path, monkeypatch):
+    # Regression test: _save_clip's "Clip Ready" incident used to always
+    # report a hardcoded 0.0 confidence, regardless of what actually
+    # triggered the recording -- so a real 90%-confidence knife
+    # detection would show up in Incident History as a 0% entry right
+    # next to the "Hazard Detected" incident that fired at 90%,
+    # reading as a failed detection when nothing failed. _start_recording
+    # now threads the triggering event's confidence through to
+    # _save_clip; this asserts that value is what actually gets passed,
+    # not just that _save_clip was called at all (see the test above).
+    clock = _fake_clock(monkeypatch)
+    worker = _make_worker(tmp_path)
+    monkeypatch.setattr(worker, "_dispatch_alert", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline_mod, "threading", SimpleNamespace(Thread=_ImmediateThread))
+    worker.cfg.POST_EVENT_SECONDS = 1
+    captured = []
+    monkeypatch.setattr(
+        worker, "_save_clip",
+        lambda frames, elapsed_seconds=None, confidence=None: captured.append(confidence),
+    )
+
+    worker.process_frame(_varied_frame(), detections=[], motion_ok=False,
+                          hazard_events=[_hazard_event()])   # detection_conf=0.9
+    clock["t"] += 2   # past POST_EVENT_SECONDS
+    worker.process_frame(_varied_frame(), detections=[], motion_ok=False, hazard_events=[])
+
+    assert captured == [0.9]
+
+
+# ---------------------------------------------------------------------
+# Hazard supervision context: a hazard object near a wrist while someone
+# else is also in frame (a caregiver, most likely) reads as normal care
+# activity, not something worth paging a caregiver about -- see the
+# HAZARD_REQUIRE_UNSUPERVISED design note in process_frame. person_count
+# comes from `detections`, the same per-frame tracked-people list every
+# other part of process_frame already receives, not a new detector call.
+# ---------------------------------------------------------------------
+
+def _two_person_detections():
+    return [("p1", (0, 0, 10, 10), None), ("p2", (20, 20, 30, 30), None)]
+
+
+def test_hazard_event_suppressed_when_supervised(tmp_path, monkeypatch):
+    _fake_clock(monkeypatch)
+    worker = _make_worker(tmp_path)
+    dispatched = []
+    monkeypatch.setattr(worker, "_dispatch_alert", lambda *a, **k: dispatched.append(a))
+
+    worker.process_frame(
+        _varied_frame(), detections=_two_person_detections(), motion_ok=False,
+        hazard_events=[_hazard_event()],
+    )
+
+    assert dispatched == []
+    assert worker.recording is False
+    assert worker._flagged_hazard_boxes == []
+
+
+def test_hazard_event_fires_when_alone(tmp_path, monkeypatch):
+    # Regression check that the supervision gate doesn't also suppress
+    # the case it exists to let through: exactly one tracked person
+    # (the patient, alone) must still fire normally.
+    _fake_clock(monkeypatch)
+    worker = _make_worker(tmp_path)
+    dispatched = []
+    monkeypatch.setattr(worker, "_dispatch_alert", lambda *a, **k: dispatched.append(a))
+
+    worker.process_frame(
+        _varied_frame(), detections=[("p1", (0, 0, 10, 10), None)], motion_ok=False,
+        hazard_events=[_hazard_event()],
+    )
+
+    assert len(dispatched) == 1
+    assert worker.recording is True
+
+
+def test_hazard_require_unsupervised_false_still_fires_when_supervised(tmp_path, monkeypatch):
+    _fake_clock(monkeypatch)
+    worker = _make_worker(tmp_path)
+    worker.cfg.HAZARD_REQUIRE_UNSUPERVISED = False
+    dispatched = []
+    monkeypatch.setattr(worker, "_dispatch_alert", lambda *a, **k: dispatched.append(a))
+
+    worker.process_frame(
+        _varied_frame(), detections=_two_person_detections(), motion_ok=False,
+        hazard_events=[_hazard_event()],
+    )
+
+    assert len(dispatched) == 1
+    assert worker.recording is True
+
+
+def test_hazard_quiet_hours_marks_the_dispatched_event(tmp_path, monkeypatch):
+    _fake_clock(monkeypatch)
+    worker = _make_worker(tmp_path)
+    worker.cfg.HAZARD_QUIET_HOURS_START = 22
+    worker.cfg.HAZARD_QUIET_HOURS_END   = 6
+
+    class _FakeDatetime:
+        @staticmethod
+        def now():
+            return SimpleNamespace(hour=2)   # 2am -- inside the 22->6 window
+    monkeypatch.setattr(pipeline_mod, "datetime", _FakeDatetime)
+
+    dispatched = []
+    monkeypatch.setattr(worker, "_dispatch_alert", lambda notifier_args, api_payload: dispatched.append(api_payload))
+
+    worker.process_frame(
+        _varied_frame(), detections=[("p1", (0, 0, 10, 10), None)], motion_ok=False,
+        hazard_events=[_hazard_event()],
+    )
+
+    assert len(dispatched) == 1
+    assert dispatched[0]["quiet_hours"] is True
+    assert "quiet hours" in dispatched[0]["detail"]
+
+
+def test_hazard_outside_quiet_hours_is_not_marked(tmp_path, monkeypatch):
+    _fake_clock(monkeypatch)
+    worker = _make_worker(tmp_path)
+    worker.cfg.HAZARD_QUIET_HOURS_START = 22
+    worker.cfg.HAZARD_QUIET_HOURS_END   = 6
+
+    class _FakeDatetime:
+        @staticmethod
+        def now():
+            return SimpleNamespace(hour=14)   # 2pm -- outside the 22->6 window
+    monkeypatch.setattr(pipeline_mod, "datetime", _FakeDatetime)
+
+    dispatched = []
+    monkeypatch.setattr(worker, "_dispatch_alert", lambda notifier_args, api_payload: dispatched.append(api_payload))
+
+    worker.process_frame(
+        _varied_frame(), detections=[("p1", (0, 0, 10, 10), None)], motion_ok=False,
+        hazard_events=[_hazard_event()],
+    )
+
+    assert len(dispatched) == 1
+    assert dispatched[0]["quiet_hours"] is False
+    assert "quiet hours" not in dispatched[0]["detail"]
 
 
 # ---------------------------------------------------------------------
@@ -538,7 +680,7 @@ def test_fighting_event_eventually_saves_a_clip(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline_mod, "threading", SimpleNamespace(Thread=_ImmediateThread))
     worker.cfg.POST_EVENT_SECONDS = 1
     saved = []
-    monkeypatch.setattr(worker, "_save_clip", lambda frames, elapsed_seconds=None: saved.append(frames))
+    monkeypatch.setattr(worker, "_save_clip", lambda frames, elapsed_seconds=None, confidence=None: saved.append(frames))
 
     worker.process_frame(_varied_frame(), detections=[], motion_ok=False)
     assert worker.recording is True
@@ -689,7 +831,7 @@ def test_process_frame_passes_the_real_elapsed_span_to_save_clip(tmp_path, monke
     worker.cfg.POST_EVENT_SECONDS = 5
 
     captured = []
-    monkeypatch.setattr(worker, "_save_clip", lambda frames, elapsed_seconds=None: captured.append(elapsed_seconds))
+    monkeypatch.setattr(worker, "_save_clip", lambda frames, elapsed_seconds=None, confidence=None: captured.append(elapsed_seconds))
 
     worker.process_frame(_varied_frame(), detections=[], motion_ok=False, hazard_events=[_hazard_event()])
     assert worker.recording is True

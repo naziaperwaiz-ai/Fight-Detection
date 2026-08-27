@@ -92,6 +92,22 @@ class Config:
     # already makes.
     HAZARD_BOX_DISPLAY_SECONDS   = 5
 
+    # Supervision context (see pipeline.py's process_frame): a hazard
+    # object near a wrist while someone else is also in frame reads as
+    # normal, expected activity -- cooking together, handing over
+    # scissors -- not something a caregiver needs paged for. Set False
+    # to alert on every hazard object regardless of who else is present.
+    HAZARD_REQUIRE_UNSUPERVISED  = True
+    # "Quiet hours" during which the patient is expected to be asleep --
+    # an unsupervised hazard event during this window is marked with
+    # elevated urgency (see _hazard_quiet_hours_active), though it does
+    # not change whether the event fires. Both None (the default) means
+    # quiet hours are off; there is no safe universal default here, it
+    # depends on the patient's actual routine. 24-hour clock, wraps past
+    # midnight correctly (e.g. 22 -> 6 means 10pm-6am).
+    HAZARD_QUIET_HOURS_START     = None
+    HAZARD_QUIET_HOURS_END       = None
+
     # --- Live feed privacy blur -----------------------------------------
     # The dashboard's live camera feed (video_feed) stays a frozen,
     # heavily pixelated placeholder except while a tracked person is at

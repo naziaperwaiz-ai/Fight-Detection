@@ -69,6 +69,22 @@ def _build_camera_config(cam_config, dashboard_url=None, dashboard_cert_path=Non
     cfg.MOTION_THRESHOLD   = sys_settings.get("motion_threshold", cfg.MOTION_THRESHOLD)
     cfg.BUFFER_SECONDS     = sys_settings.get("buffer_seconds", cfg.BUFFER_SECONDS)
     cfg.POST_EVENT_SECONDS = sys_settings.get("post_event_seconds", cfg.POST_EVENT_SECONDS)
+    # Hazard supervision context -- same "edited in System Settings,
+    # applied here at engine startup, not live-reloaded" pattern as the
+    # four settings just above. Previously these two only existed as
+    # config.py class attributes with no dashboard control at all; see
+    # _system_settings_with_defaults in dashboard/app.py for where the
+    # defaults come from when nothing's been saved yet.
+    # getattr, not direct attribute access: cfg here can be a user's own
+    # config.py (or, in tests, a minimal stand-in), predating these
+    # settings existing at all -- same defensive pattern pipeline.py
+    # already uses for every HAZARD_* field, for the same reason.
+    cfg.HAZARD_REQUIRE_UNSUPERVISED = sys_settings.get(
+        "hazard_require_unsupervised", getattr(cfg, "HAZARD_REQUIRE_UNSUPERVISED", True))
+    cfg.HAZARD_QUIET_HOURS_START = sys_settings.get(
+        "hazard_quiet_hours_start", getattr(cfg, "HAZARD_QUIET_HOURS_START", None))
+    cfg.HAZARD_QUIET_HOURS_END = sys_settings.get(
+        "hazard_quiet_hours_end", getattr(cfg, "HAZARD_QUIET_HOURS_END", None))
     return cfg
 
 
