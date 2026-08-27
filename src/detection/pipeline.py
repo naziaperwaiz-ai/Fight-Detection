@@ -6,29 +6,14 @@ import torch.nn as nn
 import torchvision.transforms as T
 from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 import time
 import numpy as np
 import threading
-import os
-import shutil
-import subprocess
 
 from detection.config import Config
 from notification.notifier import Notifier, load_alert_settings
-
-# cv2.VideoWriter's "mp4v" fourcc (MPEG-4 Part 2 / Simple Profile) writes a
-# perfectly valid, fully-playable-in-VLC .mp4 -- but no mainstream browser
-# (Chrome, Edge, Firefox, Safari) ships an MPEG-4 Part 2 decoder for
-# <video>. A clip written with just mp4v loads in the dashboard player as a
-# black frame stuck at 0:00 with a dead scrubber, even though the file on
-# disk is complete and the right duration -- that's a codec-support
-# failure, not a recording failure. _save_clip below writes the raw frames
-# with mp4v (the only fourcc every OpenCV/FFmpeg build can be counted on to
-# actually support) and then shells out to the system `ffmpeg` binary to
-# transcode that into H.264/yuv420p, which every browser can decode.
-# Resolved once at import time rather than per clip.
-_FFMPEG_BIN = shutil.which("ffmpeg")
 
 
 class SimpleIOUTracker:
@@ -262,6 +247,12 @@ class CameraWorker:
         # buffer_times rather than assumed from BUFFER_SECONDS -- see
         # _start_recording.
         self._record_pre_event_span = 0.0
+        # The confidence/score that triggered the current/last recording
+        # (see _start_recording's `confidence` param) -- so the eventual
+        # "Clip Ready" incident this recording produces can report the
+        # real value that caused it instead of a meaningless hardcoded
+        # 0.0. None until a recording has actually started once.
+        self.record_trigger_confidence = None
         self.notifier      = Notifier(config)
         self._prev_gray    = None
 
@@ -373,6 +364,32 @@ class CameraWorker:
         small = cv2.resize(frame, (max(1, w // 24), max(1, h // 24)), interpolation=cv2.INTER_LINEAR)
         return cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
 
+    def _hazard_quiet_hours_active(self):
+        """True if the current wall-clock hour falls inside the
+        deployer-configured "quiet hours" window (HAZARD_QUIET_HOURS_
+        START/_END, e.g. 22 -> 6 for 10pm-6am). Off by default (both
+        None) since "what hours should a patient normally be asleep" is
+        genuinely per-deployment and per-patient, not something safe to
+        assume. Handles a window that wraps past midnight (start > end)
+        the same way it handles one that doesn't.
+
+        This does not gate whether a hazard event fires -- see
+        HAZARD_REQUIRE_UNSUPERVISED in process_frame for that. It only
+        marks an already-fired event as elevated-urgency context: a
+        patient alone with a knife at 3am is a materially different
+        situation from the same possession at 2pm, even though the
+        underlying detection (object near wrist, unsupervised) is
+        identical either way.
+        """
+        start = getattr(self.cfg, "HAZARD_QUIET_HOURS_START", None)
+        end   = getattr(self.cfg, "HAZARD_QUIET_HOURS_END", None)
+        if start is None or end is None:
+            return False
+        hour = datetime.now().hour
+        if start <= end:
+            return start <= hour < end
+        return hour >= start or hour < end   # window wraps past midnight
+
     def _flag_hazard_box(self, ev):
         """Records that a hazard event just fired, so _draw_hazard_boxes
         below draws a box on it for a short window. ev["bbox"] is the
@@ -405,7 +422,7 @@ class CameraWorker:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         return frame
 
-    def _start_recording(self, now):
+    def _start_recording(self, now, confidence=None):
         """Begins buffering a post-event clip: snapshots the pre-event
         buffer (self.buffer already holds the last BUFFER_SECONDS worth
         of raw frames), marks recording active, and starts the
@@ -427,11 +444,26 @@ class CameraWorker:
         assuming config.FPS was actually achieved produced clips whose
         reported duration didn't match how long the buffer/recording
         window actually was.
+
+        `confidence`, if given, is the score/confidence of whatever
+        event actually triggered this recording -- avg_score() for the
+        violence-threshold and Fighting paths, ev["detection_conf"] for
+        Hazard, or the same 1.0 "rule fired, not a probability"
+        convention Emergency/Fall already use in their own
+        _dispatch_alert calls. Stored on self.record_trigger_confidence
+        so the eventual "Clip Ready" incident _save_clip produces can
+        report the real value instead of a hardcoded placeholder. Left
+        as whatever the *first* trigger in an already-active recording
+        set it to (this method only ever runs when not self.alert_active
+        -- see every call site -- so a second event firing mid-recording
+        never overwrites it), matching the existing rule that an
+        in-progress clip's buffer isn't reset by a later event either.
         """
         self.alert_active      = True
         self.recording         = True
         self.record_frames     = list(self.buffer)
         self.record_start_time = now
+        self.record_trigger_confidence = confidence
         self._record_pre_event_span = (
             (now - self.buffer_times[0]) if self.buffer_times else 0.0
         )
@@ -669,7 +701,34 @@ class CameraWorker:
                 self.state_machine.update(track_id, s, bbox, frame)
         self.state_machine.update_all(detections)
 
+        # HAZARD_REQUIRE_UNSUPERVISED (default True): a hazard-class
+        # object near a wrist is normal, expected activity when someone
+        # else -- a caregiver, family member, anyone -- is also in frame
+        # with the patient (cooking together, handing over scissors for
+        # a craft, etc.). It only becomes something a caregiver needs to
+        # know about when the patient is alone with it. person_count
+        # comes from `detections`, this same frame's tracked people --
+        # already computed by the caller, not a new detector pass.
+        # Deliberately a per-frame count, not identity: this system does
+        # not distinguish "caregiver" from "another resident" from
+        # "stranger," so "more than one person" is the only supervision
+        # signal available. A deployment that wants every hazard flagged
+        # regardless can set this False.
+        person_count         = len(detections)
+        unsupervised         = person_count <= 1
+        require_unsupervised = getattr(self.cfg, "HAZARD_REQUIRE_UNSUPERVISED", True)
+        quiet_hours           = self._hazard_quiet_hours_active()
+
         for ev in hazard_events:
+            if require_unsupervised and not unsupervised:
+                print(f"[{self.cfg.CAMERA_ID}] Hazard object ({ev['object']}) near a wrist but "
+                      f"supervised ({person_count} people in frame) -- not alerting")
+                continue
+
+            ev["person_count"] = person_count
+            ev["unsupervised"] = unsupervised
+            ev["quiet_hours"]  = quiet_hours
+
             # Flagging the box is deliberately outside the cooldown gate
             # below: cooldown exists to stop repeat emails/incident spam
             # for the same ongoing hazard, not to hide visual state a
@@ -689,13 +748,17 @@ class CameraWorker:
             # in-progress recording -- from this hazard event or from a
             # violence alert -- is never interrupted or its buffer reset.
             if not self.alert_active:
-                self._start_recording(now)
-                print(f"[{self.cfg.CAMERA_ID}] Recording clip for hazard event: {ev['object']}")
+                self._start_recording(now, confidence=ev["detection_conf"])
+                print(f"[{self.cfg.CAMERA_ID}] Recording clip for hazard event: {ev['object']} "
+                      f"(unsupervised, {'quiet hours' if quiet_hours else 'daytime'})")
             if (now - self.last_alert_time) > cooldown_seconds:
                 self.last_alert_time = now
                 label = f"Hazard Detected: {ev['object']}"
                 print(f"[{self.cfg.CAMERA_ID}] {label} "
                       f"(conf={ev['detection_conf']}, {ev['detail']})")
+                detail = f"{ev['object']} ({ev['severity']} severity), {ev['detail']}, unsupervised"
+                if quiet_hours:
+                    detail += ", during quiet hours"
                 self._dispatch_alert(
                     (self.cfg.CAMERA_ID, self.cfg.ROOM_NAME, label, ev["detection_conf"], "Saving..."),
                     {
@@ -704,8 +767,9 @@ class CameraWorker:
                         "event_type": "Hazard Detected",
                         "confidence": ev["detection_conf"],
                         "clip_path":  "Saving...",
-                        "detail": (f"{ev['object']} ({ev['severity']} severity), "
-                                   f"{ev['detail']}"),
+                        "detail":     detail,
+                        "person_count": person_count,
+                        "quiet_hours":  quiet_hours,
                     },
                 )
 
@@ -723,7 +787,7 @@ class CameraWorker:
         cooldown_ok = (now - self.last_alert_time) > cooldown_seconds
 
         if confirmed and cooldown_ok and not self.alert_active:
-            self._start_recording(now)
+            self._start_recording(now, confidence=avg_score)
             self.last_alert_time   = now
             print(f"[{self.cfg.CAMERA_ID}] ALERT! Score: {avg_score:.2f}")
 
@@ -772,8 +836,19 @@ class CameraWorker:
                 # instead of assuming config.FPS was actually achieved --
                 # see _save_clip's docstring.
                 elapsed_seconds = self._record_pre_event_span + (now - self.record_start_time)
+                # Same reason this is snapshotted here and handed to
+                # _save_clip as an explicit argument, rather than read
+                # from self.record_trigger_confidence inside the
+                # background thread: self.alert_active is about to be
+                # reset to False a few lines down, and a new event on the
+                # very next frame could call _start_recording again --
+                # and overwrite self.record_trigger_confidence -- before
+                # this background thread actually runs.
+                trigger_confidence = self.record_trigger_confidence
                 threading.Thread(
-                    target=self._save_clip, args=(frames_to_save, elapsed_seconds), daemon=True
+                    target=self._save_clip,
+                    args=(frames_to_save, elapsed_seconds, trigger_confidence),
+                    daemon=True,
                 ).start()
                 self.recording    = False
                 self.alert_active = False
@@ -816,7 +891,10 @@ class CameraWorker:
             # moments ago. Guarded on alert_active so an already
             # in-progress recording is never interrupted or reset.
             if not self.alert_active:
-                self._start_recording(now)
+                # 1.0 here matches the same "rule fired, not a model
+                # probability" convention this block's own _dispatch_alert
+                # call below already uses for Emergency's confidence.
+                self._start_recording(now, confidence=1.0)
                 print(f"[{self.cfg.CAMERA_ID}] Recording clip for emergency event")
             if (now - self.last_alert_time) > cooldown_seconds:
                 self.last_alert_time = now
@@ -852,7 +930,10 @@ class CameraWorker:
             # a fall gets a saved clip even when the alert itself is
             # cooldown-suppressed.
             if not self.alert_active:
-                self._start_recording(now)
+                # Same 1.0 "rule fired, not a model probability"
+                # convention as Emergency above and as this block's own
+                # _dispatch_alert call below.
+                self._start_recording(now, confidence=1.0)
                 print(f"[{self.cfg.CAMERA_ID}] Recording clip for fall event")
             if (now - self.last_alert_time) > cooldown_seconds:
                 self.last_alert_time = now
@@ -891,28 +972,37 @@ class CameraWorker:
         # one per event type.
         if self.state_machine.has_fighting():
             now = time.time()
+            # motion_confirmed_fight is set by
+            # StateMachine._update_motion_fight_pair when a track reached
+            # Fighting via the motion/proximity backup signal rather than
+            # avg_score() crossing VIOLENCE_THRESHOLD. Computed and
+            # printed here, OUTSIDE the cooldown gate below, specifically
+            # so a recording that fires without a paired alert print
+            # (cooldown-suppressed -- see the comment above the recording
+            # block) still self-identifies which mechanism triggered it
+            # in the console. Without this, diagnosing a reported false
+            # positive after the fact requires the alert to have printed
+            # on the exact frame it happened, which cooldown makes
+            # unreliable.
+            motion_confirmed = any(
+                getattr(track, "motion_confirmed_fight", False)
+                for track in self.state_machine.tracks.values()
+            )
             # Same recording pattern as the emergency/fall blocks above:
             # start outside the cooldown gate, guarded only on
             # alert_active, so a fighting event gets a saved clip even
             # when the alert itself is cooldown-suppressed.
             if not self.alert_active:
-                self._start_recording(now)
-                print(f"[{self.cfg.CAMERA_ID}] Recording clip for fighting event")
+                # avg_score here matches this block's own _dispatch_alert
+                # call below, which reports avg_score for Fighting
+                # regardless of whether motion_confirmed is what actually
+                # triggered the escalation -- see that call's comment.
+                self._start_recording(now, confidence=avg_score)
+                trigger = "motion/proximity backup signal" if motion_confirmed else "classifier score"
+                print(f"[{self.cfg.CAMERA_ID}] Recording clip for fighting event (trigger: {trigger}, "
+                      f"classifier score was {avg_score:.2f})")
             if (now - self.last_alert_time) > cooldown_seconds:
                 self.last_alert_time = now
-                # motion_confirmed_fight is set by
-                # StateMachine._update_motion_fight_pair when a track
-                # reached Fighting via the motion/proximity backup
-                # signal rather than avg_score() crossing
-                # VIOLENCE_THRESHOLD. Surfacing it here tells an operator
-                # (or anyone reading logs later) *why* this alert fired
-                # even if the printed/stored confidence looks low -- the
-                # classifier didn't confirm it, sustained mutual motion
-                # did.
-                motion_confirmed = any(
-                    getattr(track, "motion_confirmed_fight", False)
-                    for track in self.state_machine.tracks.values()
-                )
                 if motion_confirmed:
                     print(f"[{self.cfg.CAMERA_ID}] FIGHTING DETECTED (motion/proximity backup signal, "
                           f"classifier score was {avg_score:.2f})")
@@ -949,7 +1039,7 @@ class CameraWorker:
         self._publish_live_frame(frame, hazard_events)
         return frame
 
-    def _save_clip(self, frames=None, elapsed_seconds=None):
+    def _save_clip(self, frames=None, elapsed_seconds=None, confidence=None):
         """Writes the buffered alert clip to disk and notifies.
 
         frames: explicit snapshot of the frames to save. Callers dispatch
@@ -963,6 +1053,18 @@ class CameraWorker:
         Defaults to self.record_frames for any direct or synchronous
         caller (for example, tests) that is not going through that
         dispatch path.
+
+        confidence: the score/confidence of whatever event actually
+        triggered this recording (see _start_recording's `confidence`
+        param), reported on the "Clip Ready" incident this method
+        produces below. Used to matter that this incident's confidence
+        reflects the real triggering event instead of a hardcoded
+        placeholder -- a knife-near-wrist clip reported at 0% next to a
+        classifier's real 47%/53% reads as "detection failed" to anyone
+        skimming Incident History, when what actually happened is the
+        clip finished saving. Falls back to 0.0 when None (a direct/
+        synchronous caller not going through process_frame's recording
+        path, same fallback pattern as elapsed_seconds above).
 
         elapsed_seconds: real wall-clock time the pre-event buffer plus
         post-event recording window actually spanned (see process_frame's
@@ -984,14 +1086,12 @@ class CameraWorker:
         that case.
         """
         frames = self.record_frames if frames is None else frames
+        confidence = 0.0 if confidence is None else confidence
         if not frames:
             return
         Path(self.cfg.CLIPS_DIR).mkdir(parents=True, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         out_path  = (Path(self.cfg.CLIPS_DIR) / f"alert_{self.cfg.CAMERA_ID}_{timestamp}.mp4").as_posix()
-        # Raw mp4v write always lands here first; see _FFMPEG_BIN's comment
-        # above for why this alone is not the browser-playable deliverable.
-        raw_path  = (Path(self.cfg.CLIPS_DIR) / f"_raw_{self.cfg.CAMERA_ID}_{timestamp}.mp4").as_posix()
         h, w      = frames[0].shape[:2]
         # A fraction-of-a-second elapsed_seconds (clock hiccup, or a
         # direct caller that never went through _start_recording) can't
@@ -1003,47 +1103,12 @@ class CameraWorker:
         else:
             fps = self.cfg.FPS
         writer    = cv2.VideoWriter(
-            raw_path, cv2.VideoWriter_fourcc(*"mp4v"),
+            out_path, cv2.VideoWriter_fourcc(*"mp4v"),
             fps, (w, h)
         )
         for f in frames:
             writer.write(f)
         writer.release()
-
-        # Transcode the mp4v intermediate into H.264 so the dashboard's
-        # <video> player can actually decode it. Skipped (rather than
-        # crashing _save_clip) when the raw file never materialized --
-        # e.g. tests that monkeypatch cv2.VideoWriter with a fake that
-        # doesn't touch disk -- or when ffmpeg isn't installed, in which
-        # case the raw mp4v file is kept under out_path as a best-effort
-        # fallback: it won't play in-browser, but it's still a real,
-        # complete recording that VLC/ffplay/etc. can open, rather than
-        # being silently discarded.
-        if not Path(raw_path).exists():
-            pass
-        elif _FFMPEG_BIN is None:
-            print(f"[{self.cfg.CAMERA_ID}] ffmpeg not found on PATH -- "
-                  f"keeping raw mp4v clip (will not play in the dashboard's "
-                  f"browser player): {out_path}")
-            os.replace(raw_path, out_path)
-        else:
-            try:
-                subprocess.run(
-                    [_FFMPEG_BIN, "-y", "-loglevel", "error",
-                     "-i", raw_path,
-                     "-c:v", "libx264", "-preset", "veryfast",
-                     "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                     out_path],
-                    check=True, capture_output=True, timeout=60,
-                )
-                os.remove(raw_path)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                detail = getattr(e, "stderr", b"")
-                detail = detail.decode(errors="replace") if isinstance(detail, bytes) else detail
-                print(f"[{self.cfg.CAMERA_ID}] ffmpeg transcode failed "
-                      f"({e}); keeping raw mp4v clip (will not play in the "
-                      f"dashboard's browser player): {out_path}\n{detail}")
-                os.replace(raw_path, out_path)
         print(f"[{self.cfg.CAMERA_ID}] Clip saved: {out_path}")
         # Already running off the hot path, since this method itself is
         # dispatched onto a background thread by its caller, so no need
@@ -1051,7 +1116,7 @@ class CameraWorker:
         try:
             self.notifier.send_alert(
                 self.cfg.CAMERA_ID, self.cfg.ROOM_NAME,
-                "Clip Ready", 0.0, out_path
+                "Clip Ready", confidence, out_path
             )
         except Exception as e:
             print(f"[{self.cfg.CAMERA_ID}] Clip-ready alert email failed: {e}")
@@ -1069,7 +1134,7 @@ class CameraWorker:
                     "camera_id":  self.cfg.CAMERA_ID,
                     "room":       self.cfg.ROOM_NAME,
                     "event_type": "Clip Ready",
-                    "confidence": 0.0,
+                    "confidence": confidence,
                     "clip_path":  out_path
                 },
                 headers={"X-Internal-Key": getattr(self.cfg, "INTERNAL_API_KEY", "")},

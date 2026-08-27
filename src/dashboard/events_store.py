@@ -55,17 +55,35 @@ CREATE TABLE IF NOT EXISTS events (
     detail         TEXT NOT NULL DEFAULT '',
     notes          TEXT NOT NULL DEFAULT '',
     reviewed       INTEGER NOT NULL DEFAULT 0,
-    false_positive INTEGER NOT NULL DEFAULT 0
+    false_positive INTEGER NOT NULL DEFAULT 0,
+    person_count   INTEGER,
+    quiet_hours    INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_events_room ON events(room);
 CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
 """
+
+# person_count/quiet_hours (hazard supervision context -- see
+# pipeline.py's process_frame) were added to the schema after this
+# table already existed in the wild. `CREATE TABLE IF NOT EXISTS` above
+# is a no-op against an already-created table, so it alone would never
+# add these columns to a database that predates them -- every INSERT/
+# UPDATE below would then fail with "no such column" the moment a real
+# hazard event tried to write person_count. _ADD_COLUMN_MIGRATIONS is
+# applied via ALTER TABLE, guarded by a PRAGMA table_info check so it's
+# a no-op both for a fresh database (already has the column from
+# _SCHEMA above) and for a database that's already been migrated once.
+_ADD_COLUMN_MIGRATIONS = [
+    ("person_count", "INTEGER"),
+    ("quiet_hours", "INTEGER"),
+]
 
 # Every column except id, in the fixed order used for INSERT/UPDATE
 # statements below.
 _VALUE_COLUMNS = [
     "timestamp", "camera_id", "room", "event_type", "confidence",
     "clip_path", "states", "detail", "notes", "reviewed", "false_positive",
+    "person_count", "quiet_hours",
 ]
 _ALL_COLUMNS = ["id"] + _VALUE_COLUMNS
 
@@ -74,6 +92,12 @@ _DEFAULTS = {
     "event_type": "unknown", "confidence": 0.0, "clip_path": "",
     "states": [], "detail": "", "notes": "", "reviewed": False,
     "false_positive": False,
+    # None, not 0/False, for both: person_count/quiet_hours only ever
+    # get computed for a Hazard Detected event (see pipeline.py's
+    # process_frame) -- every other event type genuinely has no
+    # supervision context, which None represents and 0/False would not
+    # (0 people or "not quiet hours" are real, different claims).
+    "person_count": None, "quiet_hours": None,
 }
 
 
@@ -91,6 +115,11 @@ def _row_to_event(row):
     e["states"] = json.loads(e["states"]) if e["states"] else []
     e["reviewed"] = bool(e["reviewed"])
     e["false_positive"] = bool(e["false_positive"])
+    # quiet_hours is stored as INTEGER (0/1/NULL) since SQLite has no
+    # real boolean type; NULL must come back as None, not False, same
+    # reasoning as _DEFAULTS above. person_count needs no conversion --
+    # SQLite already hands back a Python int or None as-is.
+    e["quiet_hours"] = None if e["quiet_hours"] is None else bool(e["quiet_hours"])
     return e
 
 
@@ -109,6 +138,7 @@ def _event_to_row_values(event):
     row["states"] = json.dumps(row["states"])
     row["reviewed"] = 1 if row["reviewed"] else 0
     row["false_positive"] = 1 if row["false_positive"] else 0
+    row["quiet_hours"] = None if row["quiet_hours"] is None else (1 if row["quiet_hours"] else 0)
     return row
 
 
@@ -141,8 +171,28 @@ class SqliteEventsStore:
         conn.executescript(_SCHEMA)
         conn.commit()
         self._conn = conn
+        self._apply_add_column_migrations_locked()
         if self.legacy_json_path is not None:
             self._migrate_legacy_json_if_needed_locked()
+
+    def _apply_add_column_migrations_locked(self):
+        """Adds any column in _ADD_COLUMN_MIGRATIONS that isn't already
+        present. `CREATE TABLE IF NOT EXISTS` in _SCHEMA only creates
+        the table on a brand-new database -- a database file that
+        already existed before a column was added to _SCHEMA never
+        picks it up that way, and every INSERT/UPDATE would then fail
+        with "no such column" the first time real data tried to use it.
+        Checked via PRAGMA table_info rather than just trying the ALTER
+        and catching the error, so this stays a no-op (not a caught
+        exception every single startup) once a database is already
+        current."""
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(events)").fetchall()}
+        for column, sql_type in _ADD_COLUMN_MIGRATIONS:
+            if column not in existing:
+                print(f"[EVENTS] Adding missing column '{column}' to {self.db_path.name} "
+                      f"(pre-existing database from before this column existed).")
+                self._conn.execute(f"ALTER TABLE events ADD COLUMN {column} {sql_type}")
+        self._conn.commit()
 
     def _migrate_legacy_json_if_needed_locked(self):
         """One-time import of an existing events.json into this table.
