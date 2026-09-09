@@ -85,9 +85,21 @@ The diagram above is the per-frame pipeline for one camera. Running more than on
 
 ## Screenshots
 
+![Login](screenshots/login.png)
+
+![Dashboard: live camera status and alerts](screenshots/dashboard.png)
+
+![Alerts](screenshots/alerts.png)
+
+![Incident detail](screenshots/incident-detail.png)
+
 ![Incident detail: Hazard Detected (knife, high severity)](screenshots/incident-detail-hazard.png)
 
-Real screenshots live under `screenshots/` (tracked, unlike `images/` -- see the note in Project Structure), not the placeholder `images/login.png`-style paths this section used to reference. Only one is checked in so far; add more here as they're captured.
+![Analytics](screenshots/analytics.png)
+
+![System Settings (admin)](screenshots/system-settings-admin.png)
+
+Real screenshots live under `screenshots/` (tracked, unlike `images/` -- see the note in Project Structure), not the placeholder `images/login.png`-style paths this section used to reference.
 
 ---
 
