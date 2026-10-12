@@ -367,11 +367,7 @@ Hazard detection is opt-in and disabled by default (`HAZARD_DETECTION_ENABLED = 
 
 ## Model Performance
 
-| Metric | Score |
-|---|---|
-| Validation F1 | 0.8981 |
-| ROC-AUC | 0.9343 |
-| Validation Accuracy | 86.7% |
+**Evaluation:** The classifier is being re-evaluated on a video-level held-out split. Earlier validation figures used a frame-level split and are not a reliable estimate of real-world performance. Updated results will be added here.
 
 **Training datasets:** RLVS (Real Life Violence Situations, 2,000 clips), SCVD (Smart City CCTV Violence Detection), UCF-Crime (Fighting, Assault, Abuse, NormalVideos).
 
